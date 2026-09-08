@@ -26,18 +26,11 @@ and a **client/server** so applications can actually use it.
 > concurrency — that (and the roadmap below) is deliberately out of scope. The
 > docs say plainly what it does and doesn't guarantee.
 
-```text
-minidb> CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);
-minidb> INSERT INTO users VALUES (1, 'Ada', 36), (2, 'Grace', 41);
-minidb> BEGIN;
-   ...> UPDATE users SET age = 42 WHERE id = 2;
-   ...> ROLLBACK;                       -- the change never happened
-minidb> EXPLAIN SELECT * FROM users WHERE id = 1;
-QUERY PLAN
------------------------------------------
-Index Seek on users_pkey (id = 1)
-(1 row, 0.20ms)
-```
+<p align="center">
+  <img src="docs/screenshot.png" alt="A minidb REPL session: tables, an index-nested-loop join EXPLAIN, a GROUP BY aggregate, and a transaction rollback" width="720">
+</p>
+
+<p align="center"><em>A real <code>minidb</code> session — joins, an <code>EXPLAIN</code>ed index-nested-loop plan, a <code>GROUP&nbsp;BY</code> aggregate, and a rolled-back transaction.</em></p>
 
 ---
 
