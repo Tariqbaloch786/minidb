@@ -138,10 +138,10 @@ format changes bump the file magic (`MDB1` → `MDB2`) and are documented.
 
 **Tier 1 — Foundation (correctness of storage & access)**
 1. ✅ Audit + this document.
-2. **B+Tree delete: merge / redistribute / root-collapse + `validate()` + fuzz.** ← *this phase*
-3. Page checksums + corruption detection (`CorruptionError`); protect meta. *(format bump)*
+2. ✅ **B+Tree delete: merge / redistribute / root-collapse + `validate()` + fuzz.**
+3. Page checksums + corruption detection (`CorruptionError`); protect meta. *(format bump)* ← *next*
 4. Real buffer pool: bounded cache, pin/unpin, CLOCK/LRU eviction, hit/miss stats.
-5. Secondary indexes: `CREATE/DROP INDEX`, catalog metadata, maintenance on DML, planner use.
+5. ✅ **Secondary indexes:** `CREATE/DROP INDEX`, catalog metadata, order-preserving key encoding, maintenance on DML, planner selection, equality + range scans, unique/non-unique/composite.
 6. Overflow pages for large values.
 7. WAL/recovery hardening: LSNs, checkpoint records, expanded crash-injection tests.
 

@@ -34,34 +34,74 @@ _LEAF_HEADER = 1 + 4 + 2  # type, next_leaf, num
 _INT_HEADER = 1 + 2  # type, num
 
 
+# -- key codecs ------------------------------------------------------------
+# The tree compares keys with Python's own ``<`` / ``==`` (which works for ints
+# and for bytes alike); only *serialization* and size accounting depend on the
+# key type, so those are factored into a small codec. The primary-key trees use
+# the fixed-width int codec (byte-identical to the original format); secondary
+# indexes use the variable-width bytes codec.
+class _IntCodec:
+    fixed_size = 8
+
+    def pack(self, key: int) -> bytes:
+        return struct.pack("<q", key)
+
+    def unpack(self, buf, pos: int):
+        return struct.unpack_from("<q", buf, pos)[0], 8
+
+    def size(self, key: int) -> int:
+        return 8
+
+
+class _BytesCodec:
+    fixed_size = None  # variable-width keys
+
+    def pack(self, key: bytes) -> bytes:
+        return struct.pack("<I", len(key)) + key
+
+    def unpack(self, buf, pos: int):
+        (n,) = struct.unpack_from("<I", buf, pos)
+        return bytes(buf[pos + 4 : pos + 4 + n]), 4 + n
+
+    def size(self, key: bytes) -> int:
+        return 4 + len(key)
+
+
+INT_CODEC = _IntCodec()
+BYTES_CODEC = _BytesCodec()
+
+
 class _Leaf:
     __slots__ = ("keys", "vals", "next_leaf")
 
     def __init__(self, keys=None, vals=None, next_leaf=NO_PAGE):
-        self.keys: list[int] = keys or []
+        self.keys: list = keys or []
         self.vals: list[bytes] = vals or []
         self.next_leaf = next_leaf
 
-    def nbytes(self) -> int:
-        return _LEAF_HEADER + sum(8 + 4 + len(v) for v in self.vals)
+    def nbytes(self, codec) -> int:
+        return _LEAF_HEADER + sum(codec.size(k) + 4 + len(v)
+                                  for k, v in zip(self.keys, self.vals))
 
-    def serialize(self) -> bytes:
+    def serialize(self, codec) -> bytes:
         out = bytearray()
         out += struct.pack("<BiH", _LEAF, self.next_leaf, len(self.keys))
         for k, v in zip(self.keys, self.vals):
-            out += struct.pack("<qI", k, len(v)) + v
+            out += codec.pack(k) + struct.pack("<I", len(v)) + v
         if len(out) > PAGE_SIZE:
             raise ValueError("leaf overflow")
         return bytes(out) + b"\x00" * (PAGE_SIZE - len(out))
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "_Leaf":
+    def deserialize(cls, data: bytes, codec) -> "_Leaf":
         _, next_leaf, num = struct.unpack_from("<BiH", data, 0)
         pos = _LEAF_HEADER
         keys, vals = [], []
         for _ in range(num):
-            k, vlen = struct.unpack_from("<qI", data, pos)
-            pos += 12
+            k, ksz = codec.unpack(data, pos)
+            pos += ksz
+            (vlen,) = struct.unpack_from("<I", data, pos)
+            pos += 4
             vals.append(bytes(data[pos : pos + vlen]))
             pos += vlen
             keys.append(k)
@@ -72,17 +112,17 @@ class _Internal:
     __slots__ = ("keys", "children")
 
     def __init__(self, keys=None, children=None):
-        self.keys: list[int] = keys or []
+        self.keys: list = keys or []
         self.children: list[int] = children or []
 
-    def nbytes(self) -> int:
-        return _INT_HEADER + 8 * len(self.keys) + 4 * len(self.children)
+    def nbytes(self, codec) -> int:
+        return _INT_HEADER + sum(codec.size(k) for k in self.keys) + 4 * len(self.children)
 
-    def serialize(self) -> bytes:
+    def serialize(self, codec) -> bytes:
         out = bytearray()
         out += struct.pack("<BH", _INTERNAL, len(self.keys))
         for k in self.keys:
-            out += struct.pack("<q", k)
+            out += codec.pack(k)
         for c in self.children:
             out += struct.pack("<i", c)
         if len(out) > PAGE_SIZE:
@@ -90,11 +130,14 @@ class _Internal:
         return bytes(out) + b"\x00" * (PAGE_SIZE - len(out))
 
     @classmethod
-    def deserialize(cls, data: bytes) -> "_Internal":
+    def deserialize(cls, data: bytes, codec) -> "_Internal":
         _, num = struct.unpack_from("<BH", data, 0)
         pos = _INT_HEADER
-        keys = list(struct.unpack_from("<%dq" % num, data, pos))
-        pos += 8 * num
+        keys = []
+        for _ in range(num):
+            k, ksz = codec.unpack(data, pos)
+            pos += ksz
+            keys.append(k)
         children = list(struct.unpack_from("<%di" % (num + 1), data, pos))
         return cls(keys, children)
 
@@ -103,28 +146,31 @@ def _is_leaf(data: bytes) -> bool:
     return data[0] == _LEAF
 
 
-# max internal fan-out that always fits in a page (fixed-size entries)
+# max internal fan-out that always fits in a page (fixed 8-byte int keys)
 _MAX_INT_KEYS = (PAGE_SIZE - _INT_HEADER - 4) // 12
 
 
 class BPlusTree:
-    def __init__(self, pager: Pager, root_page_id: int):
+    def __init__(self, pager: Pager, root_page_id: int, codec=INT_CODEC):
         self.pager = pager
         self.root = root_page_id
+        self.codec = codec
 
     # -- construction ------------------------------------------------------
     @classmethod
-    def create(cls, pager: Pager) -> "BPlusTree":
+    def create(cls, pager: Pager, codec=INT_CODEC) -> "BPlusTree":
         root = pager.allocate_page()
-        pager.write_page(root, _Leaf().serialize())
-        return cls(pager, root)
+        pager.write_page(root, _Leaf().serialize(codec))
+        return cls(pager, root, codec)
 
     def _load(self, page_id: int):
         data = bytes(self.pager.read_page(page_id))
-        return _Leaf.deserialize(data) if _is_leaf(data) else _Internal.deserialize(data)
+        if _is_leaf(data):
+            return _Leaf.deserialize(data, self.codec)
+        return _Internal.deserialize(data, self.codec)
 
     def _store(self, page_id: int, node) -> None:
-        self.pager.write_page(page_id, node.serialize())
+        self.pager.write_page(page_id, node.serialize(self.codec))
 
     # -- point lookup ------------------------------------------------------
     def get(self, key: int) -> Optional[bytes]:
@@ -159,7 +205,7 @@ class BPlusTree:
         node = self._load(page_id)
         if isinstance(node, _Leaf):
             self._leaf_upsert(node, key, value)
-            if node.nbytes() <= PAGE_SIZE:
+            if node.nbytes(self.codec) <= PAGE_SIZE:
                 self._store(page_id, node)
                 return None
             return self._split_leaf(page_id, node)
@@ -172,10 +218,15 @@ class BPlusTree:
         sep_key, right_id = split
         node.keys.insert(idx, sep_key)
         node.children.insert(idx + 1, right_id)
-        if len(node.keys) <= _MAX_INT_KEYS:
+        if not self._internal_overflow(node):
             self._store(page_id, node)
             return None
         return self._split_internal(page_id, node)
+
+    def _internal_overflow(self, node: _Internal) -> bool:
+        if self.codec.fixed_size is not None:
+            return len(node.keys) > _MAX_INT_KEYS
+        return node.nbytes(self.codec) > PAGE_SIZE
 
     @staticmethod
     def _leaf_upsert(node: _Leaf, key: int, value: bytes) -> None:
@@ -258,13 +309,15 @@ class BPlusTree:
         self._store(page_id, node)
         return found, self._internal_underfull(node, is_root)
 
-    @staticmethod
-    def _leaf_underfull(node: _Leaf, is_root: bool) -> bool:
-        return (not is_root) and node.nbytes() < PAGE_SIZE // 2
+    def _leaf_underfull(self, node: _Leaf, is_root: bool) -> bool:
+        return (not is_root) and node.nbytes(self.codec) < PAGE_SIZE // 2
 
-    @staticmethod
-    def _internal_underfull(node: _Internal, is_root: bool) -> bool:
-        return (not is_root) and len(node.keys) < max(1, _MAX_INT_KEYS // 2)
+    def _internal_underfull(self, node: _Internal, is_root: bool) -> bool:
+        if is_root:
+            return False
+        if self.codec.fixed_size is not None:
+            return len(node.keys) < max(1, _MAX_INT_KEYS // 2)
+        return node.nbytes(self.codec) < PAGE_SIZE // 2
 
     def _rebalance(self, parent: _Internal, idx: int) -> None:
         """Fix ``parent.children[idx]`` after it underflowed: merge with a
@@ -275,22 +328,26 @@ class BPlusTree:
                  if idx + 1 < len(parent.children) else None)
 
         # Prefer merging (it reclaims a page) when the result fits in one page.
-        if right is not None and self._merge_fits(child, right):
+        if right is not None and self._merge_fits(child, right, parent.keys[idx]):
             self._merge(parent, idx, child, right, parent.children[idx + 1])
-        elif left is not None and self._merge_fits(left, child):
+        elif left is not None and self._merge_fits(left, child, parent.keys[idx - 1]):
             self._merge(parent, idx - 1, left, child, parent.children[idx])
-        elif right is not None and (left is None or right.nbytes() >= left.nbytes()):
+        elif right is not None and (
+                left is None or right.nbytes(self.codec) >= left.nbytes(self.codec)):
             self._borrow_right(parent, idx, child, right, parent.children[idx + 1])
         elif left is not None:
             self._borrow_left(parent, idx, child, left, parent.children[idx - 1])
         # else: child is the only child of the root — root collapse handles it.
 
-    @staticmethod
-    def _merge_fits(left, right) -> bool:
+    def _merge_fits(self, left, right, sep_key) -> bool:
         if isinstance(left, _Leaf):
-            return left.nbytes() + right.nbytes() - _LEAF_HEADER <= PAGE_SIZE
-        total_keys = len(left.keys) + 1 + len(right.keys)  # +1 pulled-down separator
-        return _INT_HEADER + 8 * total_keys + 4 * (total_keys + 1) <= PAGE_SIZE
+            return left.nbytes(self.codec) + right.nbytes(self.codec) - _LEAF_HEADER <= PAGE_SIZE
+        merged = (_INT_HEADER
+                  + sum(self.codec.size(k) for k in left.keys)
+                  + self.codec.size(sep_key)
+                  + sum(self.codec.size(k) for k in right.keys)
+                  + 4 * (len(left.children) + len(right.children)))
+        return merged <= PAGE_SIZE
 
     def _merge(self, parent: _Internal, sep: int, left, right, right_id: int) -> None:
         """Merge the two children on either side of ``parent.keys[sep]`` into the
@@ -314,13 +371,14 @@ class BPlusTree:
         past the underflow line, fixing the separator ``parent.keys[idx]``."""
         child_id = parent.children[idx]
         if isinstance(child, _Leaf):
-            while (child.nbytes() < PAGE_SIZE // 2 and len(right.keys) > 1
-                   and child.nbytes() + 12 + len(right.vals[0]) <= PAGE_SIZE):
+            while (child.nbytes(self.codec) < PAGE_SIZE // 2 and len(right.keys) > 1
+                   and child.nbytes(self.codec)
+                   + self.codec.size(right.keys[0]) + 4 + len(right.vals[0]) <= PAGE_SIZE):
                 child.keys.append(right.keys.pop(0))
                 child.vals.append(right.vals.pop(0))
             parent.keys[idx] = right.keys[0]
         else:
-            while len(child.keys) < max(1, _MAX_INT_KEYS // 2) and len(right.keys) > 1:
+            while self._internal_underfull(child, False) and len(right.keys) > 1:
                 child.keys.append(parent.keys[idx])
                 child.children.append(right.children.pop(0))
                 parent.keys[idx] = right.keys.pop(0)
@@ -332,13 +390,14 @@ class BPlusTree:
         fixing the separator ``parent.keys[idx - 1]``."""
         child_id = parent.children[idx]
         if isinstance(child, _Leaf):
-            while (child.nbytes() < PAGE_SIZE // 2 and len(left.keys) > 1
-                   and child.nbytes() + 12 + len(left.vals[-1]) <= PAGE_SIZE):
+            while (child.nbytes(self.codec) < PAGE_SIZE // 2 and len(left.keys) > 1
+                   and child.nbytes(self.codec)
+                   + self.codec.size(left.keys[-1]) + 4 + len(left.vals[-1]) <= PAGE_SIZE):
                 child.keys.insert(0, left.keys.pop())
                 child.vals.insert(0, left.vals.pop())
             parent.keys[idx - 1] = child.keys[0]
         else:
-            while len(child.keys) < max(1, _MAX_INT_KEYS // 2) and len(left.keys) > 1:
+            while self._internal_underfull(child, False) and len(left.keys) > 1:
                 child.keys.insert(0, parent.keys[idx - 1])
                 child.children.insert(0, left.children.pop())
                 parent.keys[idx - 1] = left.keys.pop()
@@ -436,3 +495,15 @@ class BPlusTree:
         assert chain == leaves_in_order, "leaf chain disagrees with tree order"
         assert all_keys == sorted(all_keys), "global key order violated"
         return True
+
+    # -- teardown ----------------------------------------------------------
+    def free_all(self) -> None:
+        """Return every page owned by this tree to the pager free list (used
+        when an index or table is dropped)."""
+        stack = [self.root]
+        while stack:
+            page_id = stack.pop()
+            node = self._load(page_id)
+            if isinstance(node, _Internal):
+                stack.extend(node.children)
+            self.pager.free_page(page_id)

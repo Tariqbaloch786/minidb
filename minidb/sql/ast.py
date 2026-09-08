@@ -74,6 +74,19 @@ class DropTable:
 
 
 @dataclass
+class CreateIndex:
+    name: str
+    table: str
+    columns: list[str]
+    unique: bool = False
+
+
+@dataclass
+class DropIndex:
+    name: str
+
+
+@dataclass
 class Insert:
     table: str
     columns: Optional[list[str]]

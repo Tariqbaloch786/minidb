@@ -8,16 +8,17 @@ driver (like `sqlite3`), or as a **networked server** many clients share.
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-108%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
 storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, a
 hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
-an index-nested-loop strategy, **aggregation** (`GROUP BY` / `HAVING`),
-**parameterized queries**, and **MVCC transactions** — in ~3,100 lines of
-dependency-free, tested Python. On top of the engine sit a **DB-API 2.0 driver**
-and a **client/server** so applications can actually use it.
+an index-nested-loop strategy, **secondary indexes** (`CREATE INDEX`),
+**aggregation** (`GROUP BY` / `HAVING`), **parameterized queries**, and **MVCC
+transactions** — in ~3,700 lines of dependency-free, tested Python. On top of the
+engine sit a **DB-API 2.0 driver** and a **client/server** so applications can
+actually use it.
 
 > **Where it fits.** minidb is a **SQLite-class** engine: excellent for embedded
 > apps, internal tools, prototypes, tests, teaching, and small shared services.
@@ -79,9 +80,10 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 |-------|------|----------------|
 | Pager | [`storage/pager.py`](minidb/storage/pager.py) | Fixed-size page I/O, allocation, free list, dirty-page buffering |
 | WAL | [`storage/wal.py`](minidb/storage/wal.py) | Redo logging, `fsync` on commit, crash recovery, CRC-checked records |
-| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered `int → bytes` index; point, range and full scans; node splits, delete rebalancing (merge/redistribute/root-collapse), and a `validate()` invariant |
+| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered index over `int` **or** `bytes` keys; point/range/full scans; splits, delete rebalancing (merge/redistribute/root-collapse), `validate()` |
+| Indexes | [`engine/index.py`](minidb/engine/index.py) | Secondary indexes: order-preserving key encoding, unique/non-unique, maintenance |
 | Tokenizer/Parser | [`sql/`](minidb/sql/) | Hand-written lexer + recursive-descent parser → typed AST |
-| Catalog | [`engine/catalog.py`](minidb/engine/catalog.py) | Table schemas, persisted inside the DB file |
+| Catalog | [`engine/catalog.py`](minidb/engine/catalog.py) | Table **and index** schemas, persisted inside the DB file |
 | Planner | [`engine/planner.py`](minidb/engine/planner.py) | Turns `WHERE` into an index seek / range scan / seq scan + residual filter |
 | Executor | [`engine/executor.py`](minidb/engine/executor.py) | Runs statements, evaluates predicates (3-valued logic), nested-loop + index joins, writes row versions |
 | MVCC | [`txn/mvcc.py`](minidb/txn/mvcc.py) | Version chains, `xmin`/`xmax` visibility, snapshot isolation, vacuum |
@@ -216,6 +218,9 @@ back), while other writers are told the database is locked.
 CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL, score FLOAT);
 DROP TABLE t;
 
+CREATE [UNIQUE] INDEX idx_name ON t (col[, col...]);
+DROP INDEX idx_name;
+
 INSERT INTO t [(cols...)] VALUES (...), (...);
 
 SELECT * | [table.]col, ... | table.* | COUNT(*) | SUM(col) | AVG/MIN/MAX(col)
@@ -259,6 +264,28 @@ The planner splits a `WHERE` clause into conjuncts, pushes any primary-key
 bounds down into a B+Tree seek or range scan, and keeps the rest as a residual
 filter. That single optimization is the difference between the two numbers
 below.
+
+## Secondary indexes
+
+By default the primary key is the only index, so `WHERE email = ...` is a
+sequential scan. Add a secondary index and the planner switches to an index
+scan:
+
+```sql
+CREATE INDEX idx_email ON users(email);
+CREATE UNIQUE INDEX idx_sku ON products(sku);   -- enforces uniqueness
+
+EXPLAIN SELECT * FROM users WHERE email = 'ada@x.io';
+-- Index Scan on idx_email (email = 'ada@x.io')  [filter]
+```
+
+Indexes support **equality and range** scans (`=`, `<`, `<=`, `>`, `>=`),
+`UNIQUE` and non-unique, and single- or multi-column keys. They're a second
+B+Tree keyed on an **order-preserving encoding** of the value (so `bytes`
+comparison matches SQL order — that's what makes range scans work for `TEXT` and
+`FLOAT`, not just integers), with the row's primary key appended. Index entries
+are treated as *candidates* and re-checked against the visible row, so they stay
+correct under MVCC; they're maintained automatically on `INSERT` / `UPDATE`.
 
 ## Joins
 
@@ -340,7 +367,7 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 90 tests across every layer
+pytest                    # 108 tests across every layer
 ruff check .              # lint
 ```
 
@@ -358,11 +385,12 @@ directions. CI runs it on Linux and Windows across Python 3.10–3.12.
 minidb/
   storage/   pager.py  wal.py  btree.py
   sql/       tokenizer.py  ast.py  parser.py
-  engine/    catalog.py  types.py  planner.py  executor.py
+  engine/    catalog.py  types.py  planner.py  executor.py  index.py
   txn/       mvcc.py
   database.py  dbapi.py  server.py  client.py  repl.py  __main__.py
 tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py
              test_aggregation.py  test_dbapi.py  test_server.py  test_transactions.py
+             test_btree_delete.py  test_indexes.py
 benchmarks/  bench.py
 examples/    demo.py  tour.sql
 docs/        ARCHITECTURE.md
@@ -372,12 +400,13 @@ docs/        ARCHITECTURE.md
 
 Deliberately out of scope for v0.1, and each a fun next step:
 
-- [ ] Secondary indexes (right now the primary key is the only index)
+- [x] Secondary indexes — `CREATE [UNIQUE] INDEX` / `DROP INDEX`, equality + range scans, planner selection, order-preserving key encoding
 - [ ] Multi-writer concurrency with row/page-level locking (today: serialized writes)
 - [ ] `RIGHT` / `FULL` joins and a hash-join strategy for non-PK equi-joins
 - [ ] More SQL surface: `DISTINCT`, `LIKE`, subqueries, `ALTER TABLE`
 - [x] B+Tree delete rebalancing (merge / redistribute / root-collapse) with a `validate()` invariant and randomized fuzz tests
 - [ ] Page checksums + corruption detection; a bounded buffer pool with eviction
+- [ ] `RIGHT` / `FULL` joins; a hash-join strategy
 - [ ] Overflow pages for values larger than one page
 - [ ] A cost-based planner using table statistics
 

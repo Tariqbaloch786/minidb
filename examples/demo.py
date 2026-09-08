@@ -39,6 +39,12 @@ def main():
     show(db, "SELECT employees.name, orders.amount FROM employees "
              "LEFT JOIN orders ON orders.emp_id = employees.id ORDER BY employees.id")
 
+    print("\n--- secondary index ---")
+    show(db, "EXPLAIN SELECT * FROM employees WHERE name = 'Grace'")  # seq scan
+    show(db, "CREATE INDEX idx_emp_name ON employees(name)")
+    show(db, "EXPLAIN SELECT * FROM employees WHERE name = 'Grace'")  # now index scan
+    show(db, "SELECT id, dept FROM employees WHERE name = 'Grace'")
+
     print("\n--- aggregation ---")
     show(db, "SELECT emp_id, COUNT(*), SUM(amount) FROM orders GROUP BY emp_id "
              "HAVING SUM(amount) > 400 ORDER BY SUM(amount) DESC")

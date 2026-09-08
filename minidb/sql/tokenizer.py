@@ -10,6 +10,7 @@ KEYWORDS = {
     "or", "not", "null", "primary", "key", "int", "integer", "text", "float",
     "order", "by", "asc", "desc", "limit", "true", "false", "explain",
     "join", "inner", "left", "right", "outer", "on", "group", "having",
+    "index", "unique",
 }
 
 _SYMBOLS = {

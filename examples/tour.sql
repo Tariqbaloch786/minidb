@@ -25,6 +25,11 @@ EXPLAIN SELECT * FROM employees WHERE id >= 2 AND id <= 3;
 -- Filter on a non-key column -> Seq Scan with a residual filter.
 SELECT name, salary FROM employees WHERE salary > 160000 ORDER BY salary DESC;
 
+-- A secondary index turns that non-key filter into an index scan.
+CREATE INDEX idx_emp_name ON employees(name);
+EXPLAIN SELECT * FROM employees WHERE name = 'Grace';
+SELECT id, dept FROM employees WHERE name = 'Grace';
+
 -- Joins. The ON clause is an equi-join on the inner table's primary key, so
 -- the planner uses an index nested-loop join (a PK seek per outer row).
 CREATE TABLE projects (id INT PRIMARY KEY, owner_id INT, title TEXT);

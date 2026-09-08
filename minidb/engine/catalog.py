@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from ..storage.pager import NO_PAGE, PAGE_SIZE, Pager
+from .index import IndexSchema
 
 _CHUNK = PAGE_SIZE - 8  # 4 bytes next-page + 4 bytes chunk length
 
@@ -43,6 +44,7 @@ class Catalog:
     def __init__(self, pager: Pager):
         self.pager = pager
         self.tables: dict[str, TableSchema] = {}
+        self.indexes: dict[str, IndexSchema] = {}
         if pager.meta.catalog_root != NO_PAGE:
             self._load()
 
@@ -56,7 +58,10 @@ class Catalog:
             buf += page[8 : 8 + length]
             page_id = next_page
         raw = json.loads(buf.decode("utf-8"))
-        for name, spec in raw.items():
+        # Backward compatible: an old catalog was a bare {table: spec} mapping.
+        tables = raw.get("tables", raw) if isinstance(raw, dict) else {}
+        indexes = raw.get("indexes", {}) if isinstance(raw, dict) else {}
+        for name, spec in tables.items():
             self.tables[name] = TableSchema(
                 name=name,
                 columns=[tuple(c) for c in spec["columns"]],
@@ -64,16 +69,35 @@ class Catalog:
                 not_null=spec.get("not_null", []),
                 root_page_id=spec["root_page_id"],
             )
+        for name, spec in indexes.items():
+            self.indexes[name] = IndexSchema(
+                name=name,
+                table=spec["table"],
+                columns=list(spec["columns"]),
+                unique=spec.get("unique", False),
+                root_page_id=spec["root_page_id"],
+            )
 
     def save(self) -> None:
         raw = {
-            name: {
-                "columns": [list(c) for c in t.columns],
-                "pk": t.pk,
-                "not_null": t.not_null,
-                "root_page_id": t.root_page_id,
-            }
-            for name, t in self.tables.items()
+            "tables": {
+                name: {
+                    "columns": [list(c) for c in t.columns],
+                    "pk": t.pk,
+                    "not_null": t.not_null,
+                    "root_page_id": t.root_page_id,
+                }
+                for name, t in self.tables.items()
+            },
+            "indexes": {
+                name: {
+                    "table": ix.table,
+                    "columns": ix.columns,
+                    "unique": ix.unique,
+                    "root_page_id": ix.root_page_id,
+                }
+                for name, ix in self.indexes.items()
+            },
         }
         data = json.dumps(raw).encode("utf-8")
         # free the previous chain so pages are reused
@@ -105,3 +129,16 @@ class Catalog:
 
     def drop(self, name: str) -> None:
         del self.tables[name]
+
+    # -- indexes -----------------------------------------------------------
+    def get_index(self, name: str) -> Optional[IndexSchema]:
+        return self.indexes.get(name)
+
+    def add_index(self, index: IndexSchema) -> None:
+        self.indexes[index.name] = index
+
+    def drop_index(self, name: str) -> None:
+        del self.indexes[name]
+
+    def indexes_for(self, table: str) -> list[IndexSchema]:
+        return [ix for ix in self.indexes.values() if ix.table == table]

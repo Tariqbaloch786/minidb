@@ -108,8 +108,10 @@ class Parser:
         return node
 
     # -- statements --------------------------------------------------------
-    def _create(self) -> ast.CreateTable:
+    def _create(self):
         self.expect_kw("create")
+        if self.at_kw("unique", "index"):
+            return self._create_index()
         self.expect_kw("table")
         name = self.expect_ident()
         self.expect_sym("(")
@@ -151,8 +153,28 @@ class Parser:
             return "FLOAT"
         raise ParseError(f"unknown type {self.cur.value!r}")
 
-    def _drop(self) -> ast.DropTable:
+    def _create_index(self) -> ast.CreateIndex:
+        unique = False
+        if self.at_kw("unique"):
+            self.advance()
+            unique = True
+        self.expect_kw("index")
+        name = self.expect_ident()
+        self.expect_kw("on")
+        table = self.expect_ident()
+        self.expect_sym("(")
+        columns = [self.expect_ident()]
+        while self.at_sym(","):
+            self.advance()
+            columns.append(self.expect_ident())
+        self.expect_sym(")")
+        return ast.CreateIndex(name, table, columns, unique)
+
+    def _drop(self):
         self.expect_kw("drop")
+        if self.at_kw("index"):
+            self.advance()
+            return ast.DropIndex(self.expect_ident())
         self.expect_kw("table")
         return ast.DropTable(self.expect_ident())
 

@@ -13,10 +13,11 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from ..sql import ast
-from ..storage.btree import BPlusTree
+from ..storage.btree import BYTES_CODEC, BPlusTree
 from ..txn.mvcc import Transaction, Version, decode_chain, encode_chain
-from . import planner, types
+from . import index, planner, types
 from .catalog import TableSchema
+from .index import IndexSchema
 
 
 class ExecutionError(Exception):
@@ -187,6 +188,10 @@ class Executor:
             return self._create_table(stmt)
         if isinstance(stmt, ast.DropTable):
             return self._drop_table(stmt)
+        if isinstance(stmt, ast.CreateIndex):
+            return self._create_index(stmt, txn)
+        if isinstance(stmt, ast.DropIndex):
+            return self._drop_index(stmt)
         if isinstance(stmt, ast.Insert):
             return self._insert(stmt, txn)
         if isinstance(stmt, ast.Select):
@@ -219,9 +224,150 @@ class Executor:
 
     def _drop_table(self, stmt: ast.DropTable) -> Result:
         self._require_table(stmt.name)
+        for ix in self.db.catalog.indexes_for(stmt.name):
+            self._index_tree(ix).free_all()
+            self.db.catalog.drop_index(ix.name)
         self.db.catalog.drop(stmt.name)
         self.db.catalog.save()
         return Result("ddl", message=f"DROP TABLE {stmt.name}")
+
+    # -- index DDL ---------------------------------------------------------
+    def _index_tree(self, ix: IndexSchema) -> BPlusTree:
+        return BPlusTree(self.db.pager, ix.root_page_id, codec=BYTES_CODEC)
+
+    def _create_index(self, stmt: ast.CreateIndex, txn: Transaction) -> Result:
+        schema = self._require_table(stmt.table)
+        if self.db.catalog.get_index(stmt.name) is not None:
+            raise ExecutionError(f"index {stmt.name!r} already exists")
+        for col in stmt.columns:
+            if not schema.has_column(col):
+                raise ExecutionError(f"no such column: {col}")
+        col_types = [schema.type_of(c) for c in stmt.columns]
+        tree = BPlusTree.create(self.db.pager, codec=BYTES_CODEC)
+        seen: set[bytes] = set()
+        seq = planner.Plan(stmt.table, planner.SEQ_SCAN, schema.pk, residual=None)
+        for pk, row, _ in self._scan(schema, seq, txn):
+            values = [row.get(c) for c in stmt.columns]
+            if stmt.unique and all(v is not None for v in values):
+                prefix = index.encode_prefix(col_types, values)
+                if prefix in seen:
+                    tree.free_all()
+                    raise ExecutionError(
+                        f"duplicate key value violates unique index {stmt.name!r}")
+                seen.add(prefix)
+            tree.insert(index.encode_key(col_types, values, pk), index.pack_pk(pk))
+        ix = IndexSchema(stmt.name, stmt.table, list(stmt.columns), stmt.unique, tree.root)
+        self.db.catalog.add_index(ix)
+        self.db.catalog.save()
+        return Result("ddl", message=f"CREATE INDEX {stmt.name}")
+
+    def _drop_index(self, stmt: ast.DropIndex) -> Result:
+        ix = self.db.catalog.get_index(stmt.name)
+        if ix is None:
+            raise ExecutionError(f"no such index: {stmt.name}")
+        self._index_tree(ix).free_all()
+        self.db.catalog.drop_index(stmt.name)
+        self.db.catalog.save()
+        return Result("ddl", message=f"DROP INDEX {stmt.name}")
+
+    # -- index maintenance -------------------------------------------------
+    def _visible_row_by_pk(self, schema, pk, txn):
+        raw = self._tree(schema).get(pk)
+        if raw is None:
+            return None
+        version = self.db.txn_manager.visible_version(decode_chain(bytes(raw)), txn)
+        return types.deserialize_row(schema.columns, version.data) if version else None
+
+    def _enforce_unique(self, schema, ix, tree, row, pk, txn):
+        col_types = [schema.type_of(c) for c in ix.columns]
+        values = [row.get(c) for c in ix.columns]
+        if any(v is None for v in values):
+            return  # SQL UNIQUE allows any number of NULLs
+        prefix = index.encode_prefix(col_types, values)
+        hi = index.prefix_upper(prefix)
+        for _key, val in self._index_range(tree, prefix, hi):
+            other = index.unpack_pk(val)
+            if other == pk:
+                continue
+            prow = self._visible_row_by_pk(schema, other, txn)
+            if prow is not None and [prow.get(c) for c in ix.columns] == values:
+                raise ExecutionError(
+                    f"duplicate key value violates unique index {ix.name!r}")
+
+    def _index_put(self, schema, ix, tree, row, pk):
+        col_types = [schema.type_of(c) for c in ix.columns]
+        values = [row.get(c) for c in ix.columns]
+        tree.insert(index.encode_key(col_types, values, pk), index.pack_pk(pk))
+
+    @staticmethod
+    def _index_range(tree: BPlusTree, lo, hi_excl):
+        """Yield ``(key, value)`` for encoded keys in ``[lo, hi_excl)``."""
+        for k, v in tree.range(lo, None):
+            if hi_excl is not None and k >= hi_excl:
+                break
+            yield k, v
+
+    def _plan_index(self, schema, where) -> "planner.Plan | None":
+        """Pick a secondary index for an equality or range on its leading column."""
+        if where is None or (isinstance(where, ast.BinOp) and where.op == "OR"):
+            return None
+        conjuncts = planner._flatten_and(where)
+        for ix in self.db.catalog.indexes_for(schema.name):
+            lead = ix.columns[0]
+            lead_type = schema.type_of(lead)
+
+            def lit_on_lead(c, ops, _lead=lead):
+                return (isinstance(c, ast.BinOp) and c.op in ops
+                        and isinstance(c.left, ast.Column) and c.left.table is None
+                        and c.left.name == _lead and isinstance(c.right, ast.Literal))
+
+            # equality wins (tightest)
+            for c in conjuncts:
+                if lit_on_lead(c, {"="}):
+                    try:
+                        v = types.coerce(c.right.value, lead_type, lead)
+                    except types.TypeError_:
+                        continue
+                    prefix = index.encode_value(lead_type, v)
+                    return planner.Plan(
+                        schema.name, planner.INDEX_SCAN, schema.pk, residual=where,
+                        index_name=ix.name, index_root=ix.root_page_id,
+                        index_lo=prefix, index_hi=index.prefix_upper(prefix),
+                        index_desc=f"{lead} = {v!r}")
+            # otherwise a range on the leading column
+            lo_v = hi_v = None
+            for c in conjuncts:
+                if lit_on_lead(c, {">", ">=", "<", "<="}):
+                    try:
+                        v = types.coerce(c.right.value, lead_type, lead)
+                    except types.TypeError_:
+                        continue
+                    if c.op in (">", ">="):
+                        lo_v = v
+                    else:
+                        hi_v = v
+            if lo_v is not None or hi_v is not None:
+                lo = index.encode_value(lead_type, lo_v) if lo_v is not None else None
+                hi = (index.prefix_upper(index.encode_value(lead_type, hi_v))
+                      if hi_v is not None else None)
+                cond = " AND ".join(
+                    part for part in (
+                        f"{lead} >= {lo_v!r}" if lo_v is not None else "",
+                        f"{lead} <= {hi_v!r}" if hi_v is not None else "") if part)
+                return planner.Plan(
+                    schema.name, planner.INDEX_SCAN, schema.pk, residual=where,
+                    index_name=ix.name, index_root=ix.root_page_id,
+                    index_lo=lo, index_hi=hi, index_desc=cond)
+        return None
+
+    def _access_plan(self, schema, where) -> planner.Plan:
+        """PK access if possible, otherwise a secondary index, otherwise seq scan."""
+        plan = planner.plan_scan(schema.name, schema.pk, where)
+        if plan.method == planner.SEQ_SCAN:
+            idx = self._plan_index(schema, where)
+            if idx is not None:
+                return idx
+        return plan
 
     # -- INSERT ------------------------------------------------------------
     def _insert(self, stmt: ast.Insert, txn: Transaction) -> Result:
@@ -231,6 +377,8 @@ class Executor:
             if not schema.has_column(c):
                 raise ExecutionError(f"no such column: {c}")
         tree = self._tree(schema)
+        indexes = self.db.catalog.indexes_for(schema.name)
+        idx_trees = {ix.name: self._index_tree(ix) for ix in indexes}
         count = 0
         for values in stmt.rows:
             if len(values) != len(cols):
@@ -244,12 +392,28 @@ class Executor:
             chain = decode_chain(bytes(existing)) if existing is not None else []
             if self.db.txn_manager.visible_row(chain, txn) is not None:
                 raise ExecutionError(f"duplicate primary key: {pk_val}")
+            for ix in indexes:
+                if ix.unique:
+                    self._enforce_unique(schema, ix, idx_trees[ix.name], row, pk_val, txn)
             chain = self.db.txn_manager.compact(chain)
             chain.append(Version(txn.xid, 0, False, types.serialize_row(schema.columns, row)))
             tree.insert(pk_val, encode_chain(chain))
+            for ix in indexes:
+                self._index_put(schema, ix, idx_trees[ix.name], row, pk_val)
             count += 1
-        self._save_root_if_changed(schema, tree)
+        self._persist_roots(schema, tree, indexes, idx_trees)
         return Result("dml", rowcount=count, message=f"INSERT {count}")
+
+    def _persist_roots(self, schema, tree, indexes, idx_trees) -> None:
+        """Write back the table's and each index's (possibly split) root page."""
+        changed = tree.root != schema.root_page_id
+        schema.root_page_id = tree.root
+        for ix in indexes:
+            if idx_trees[ix.name].root != ix.root_page_id:
+                ix.root_page_id = idx_trees[ix.name].root
+                changed = True
+        if changed:
+            self.db.catalog.save()
 
     def _check_constraints(self, schema: TableSchema, row: dict[str, Any]) -> None:
         for name in schema.not_null:
@@ -261,6 +425,9 @@ class Executor:
     # -- scanning ----------------------------------------------------------
     def _scan(self, schema: TableSchema, plan: planner.Plan, txn: Transaction):
         """Yield (pk, row_dict, version) for rows visible to ``txn``."""
+        if plan.method == planner.INDEX_SCAN:
+            yield from self._scan_index(schema, plan, txn)
+            return
         tree = self._tree(schema)
         if plan.method == planner.INDEX_SEEK:
             raw = tree.get(plan.seek_key)
@@ -272,6 +439,28 @@ class Executor:
         for pk, raw in candidates:
             chain = decode_chain(bytes(raw))
             version = self.db.txn_manager.visible_version(chain, txn)
+            if version is None:
+                continue
+            row = types.deserialize_row(schema.columns, version.data)
+            if _passes(plan.residual, _multi_ns(schema.name, schema, row, frozenset())):
+                yield pk, row, version
+
+    def _scan_index(self, schema: TableSchema, plan: planner.Plan, txn: Transaction):
+        """Secondary-index access: index hits are *candidate* PKs, resolved
+        against the primary tree under MVCC and re-checked against the predicate
+        (so stale/duplicate index entries are harmless)."""
+        idx_tree = BPlusTree(self.db.pager, plan.index_root, codec=BYTES_CODEC)
+        pk_tree = self._tree(schema)
+        seen: set[int] = set()
+        for _key, val in self._index_range(idx_tree, plan.index_lo, plan.index_hi):
+            pk = index.unpack_pk(val)
+            if pk in seen:
+                continue
+            seen.add(pk)
+            raw = pk_tree.get(pk)
+            if raw is None:
+                continue
+            version = self.db.txn_manager.visible_version(decode_chain(bytes(raw)), txn)
             if version is None:
                 continue
             row = types.deserialize_row(schema.columns, version.data)
@@ -337,7 +526,7 @@ class Executor:
 
         # Push WHERE conjuncts that only touch the base table into its scan.
         base_where = _conjuncts_for_table(stmt.where, stmt.table, table_of)
-        base_plan = planner.plan_scan(stmt.table, base_schema.pk, base_where)
+        base_plan = self._access_plan(base_schema, base_where)
 
         if stmt.explain:
             return Result("explain", columns=["QUERY PLAN"],
@@ -573,8 +762,12 @@ class Executor:
                 raise ExecutionError(f"no such column: {col}")
             if col == schema.pk:
                 raise ExecutionError("cannot UPDATE the primary key column")
-        plan = planner.plan_scan(stmt.table, schema.pk, stmt.where)
+        plan = self._access_plan(schema, stmt.where)
         tree = self._tree(schema)
+        indexes = self.db.catalog.indexes_for(schema.name)
+        idx_trees = {ix.name: self._index_tree(ix) for ix in indexes}
+        changed_cols = {col for col, _ in stmt.assignments}
+        affected = [ix for ix in indexes if any(c in changed_cols for c in ix.columns)]
         count = 0
         # materialize first so we don't mutate the tree while scanning it
         targets = list(self._scan(schema, plan, txn))
@@ -583,6 +776,9 @@ class Executor:
             for col, lit in stmt.assignments:
                 new_row[col] = types.coerce(lit.value, schema.type_of(col), col)
             self._check_constraints(schema, new_row)
+            for ix in affected:
+                if ix.unique:
+                    self._enforce_unique(schema, ix, idx_trees[ix.name], new_row, pk, txn)
             chain = decode_chain(bytes(tree.get(pk)))
             version = self.db.txn_manager.visible_version(chain, txn)
             if version is None:
@@ -591,14 +787,16 @@ class Executor:
             chain.append(Version(txn.xid, 0, False, types.serialize_row(schema.columns, new_row)))
             chain = self.db.txn_manager.compact(chain)
             tree.insert(pk, encode_chain(chain))
+            for ix in affected:
+                self._index_put(schema, ix, idx_trees[ix.name], new_row, pk)
             count += 1
-        self._save_root_if_changed(schema, tree)
+        self._persist_roots(schema, tree, indexes, idx_trees)
         return Result("dml", rowcount=count, message=f"UPDATE {count}")
 
     # -- DELETE ------------------------------------------------------------
     def _delete(self, stmt: ast.Delete, txn: Transaction) -> Result:
         schema = self._require_table(stmt.table)
-        plan = planner.plan_scan(stmt.table, schema.pk, stmt.where)
+        plan = self._access_plan(schema, stmt.where)
         tree = self._tree(schema)
         count = 0
         targets = list(self._scan(schema, plan, txn))

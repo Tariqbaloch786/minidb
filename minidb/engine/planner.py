@@ -17,6 +17,7 @@ from ..sql import ast
 SEQ_SCAN = "SeqScan"
 INDEX_SEEK = "IndexSeek"
 INDEX_RANGE = "IndexRange"
+INDEX_SCAN = "IndexScan"  # secondary (non-PK) index
 
 
 @dataclass
@@ -28,6 +29,13 @@ class Plan:
     lo: Optional[int] = None
     hi: Optional[int] = None
     residual: Optional[Any] = None  # WHERE predicate still to evaluate per row
+    # secondary-index scan (method == INDEX_SCAN); bounds are encoded key bytes,
+    # index_hi is exclusive. The executor fills these in.
+    index_name: Optional[str] = None
+    index_root: Optional[int] = None
+    index_lo: Optional[bytes] = None
+    index_hi: Optional[bytes] = None
+    index_desc: str = ""
 
     def describe(self) -> str:
         if self.method == INDEX_SEEK:
@@ -36,6 +44,8 @@ class Plan:
             lo = "-inf" if self.lo is None else self.lo
             hi = "+inf" if self.hi is None else self.hi
             access = f"Index Range Scan on {self.table}_pkey ({lo} <= {self.pk_column} <= {hi})"
+        elif self.method == INDEX_SCAN:
+            access = f"Index Scan on {self.index_name} ({self.index_desc})"
         else:
             access = f"Seq Scan on {self.table}"
         if self.residual is not None:
