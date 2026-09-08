@@ -21,7 +21,8 @@ def show(db, sql):
 
 def main():
     db = Database(":memory:")
-    show(db, "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT NOT NULL, dept TEXT, salary INT)")
+    show(db, "CREATE TABLE employees "
+             "(id INT PRIMARY KEY, name TEXT NOT NULL, dept TEXT, salary INT)")
     show(db, "INSERT INTO employees VALUES "
              "(1, 'Ada', 'Eng', 165000), (2, 'Grace', 'Eng', 172000), "
              "(3, 'Linus', 'Kernel', 158000)")

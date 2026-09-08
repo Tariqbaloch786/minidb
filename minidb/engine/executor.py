@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from ..sql import ast
 from ..storage.btree import BPlusTree
-from ..txn.mvcc import Version, Transaction, decode_chain, encode_chain
+from ..txn.mvcc import Transaction, Version, decode_chain, encode_chain
 from . import planner, types
 from .catalog import TableSchema
 

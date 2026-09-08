@@ -12,7 +12,7 @@ import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..storage.pager import PAGE_SIZE, Pager, NO_PAGE
+from ..storage.pager import NO_PAGE, PAGE_SIZE, Pager
 
 _CHUNK = PAGE_SIZE - 8  # 4 bytes next-page + 4 bytes chunk length
 

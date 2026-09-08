@@ -21,7 +21,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff>=0.1"]
+dev = ["pytest>=7.0", "ruff>=0.15,<0.16"]
 
 [project.urls]
 Homepage = "https://github.com/Tariqbaloch786/minidb"
@@ -41,3 +41,8 @@ addopts = "-q"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# Pin an explicit, stable rule set so linting is deterministic across ruff
+# versions (newer ruff enables extra categories like UP/PYI by default).
+select = ["E", "F", "W", "I"]

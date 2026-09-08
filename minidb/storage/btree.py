@@ -26,7 +26,7 @@ from __future__ import annotations
 import struct
 from typing import Iterator, Optional
 
-from .pager import PAGE_SIZE, Pager, NO_PAGE
+from .pager import NO_PAGE, PAGE_SIZE, Pager
 
 _LEAF = 1
 _INTERNAL = 0
