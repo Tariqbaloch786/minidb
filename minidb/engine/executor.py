@@ -41,6 +41,8 @@ class Result:
 def _eval(expr: Any, row: dict[str, Any]) -> Optional[bool] | Any:
     if isinstance(expr, ast.Literal):
         return expr.value
+    if isinstance(expr, ast.Aggregate):
+        return row.get(expr.label)
     if isinstance(expr, ast.Column):
         key = expr.name if expr.table is None else f"{expr.table}.{expr.name}"
         return row.get(key)
@@ -113,11 +115,24 @@ def _multi_ns(table: str, schema: TableSchema, row: dict[str, Any],
 
 
 def _columns_in(expr: Any):
+    """Column references that are NOT inside an aggregate call."""
     if isinstance(expr, ast.Column):
         yield expr
     elif isinstance(expr, ast.BinOp):
         yield from _columns_in(expr.left)
         yield from _columns_in(expr.right)
+
+
+def _aggregates_in(expr: Any):
+    if isinstance(expr, ast.Aggregate):
+        yield expr
+    elif isinstance(expr, ast.BinOp):
+        yield from _aggregates_in(expr.left)
+        yield from _aggregates_in(expr.right)
+
+
+def _contains_aggregate(expr: Any) -> bool:
+    return next(_aggregates_in(expr), None) is not None
 
 
 def _flatten_and(expr: Any) -> list[Any]:
@@ -295,16 +310,26 @@ class Executor:
             t = table_of(col)
             return col.name if col.table is None else f"{t}.{col.name}"
 
+        # Aggregates belong in SELECT/HAVING, never in WHERE or a join ON.
+        if _contains_aggregate(stmt.where):
+            raise ExecutionError("aggregate functions are not allowed in WHERE (use HAVING)")
+        for j in stmt.joins:
+            if _contains_aggregate(j.on):
+                raise ExecutionError("aggregate functions are not allowed in a JOIN ON clause")
+
         # Validate every column reference up front (clear errors + safe eval).
         for col in _columns_in(stmt.where):
             table_of(col)
         for j in stmt.joins:
             for col in _columns_in(j.on):
                 table_of(col)
-        if stmt.order_by is not None:
+        if stmt.order_by is not None and isinstance(stmt.order_by.column, ast.Column):
             table_of(stmt.order_by.column)
         for item in stmt.columns:
-            if item.name == "*":
+            if isinstance(item, ast.Aggregate):
+                if item.column.name != "*":
+                    table_of(item.column)
+            elif item.name == "*":
                 if item.table is not None and item.table not in schemas:
                     raise ExecutionError(f"unknown table qualifier: {item.table}")
             else:
@@ -328,6 +353,11 @@ class Executor:
         # Residual WHERE (join-spanning / non-base predicates) over joined rows.
         rows = [ns for ns in rows if _passes(stmt.where, ns)]
 
+        grouped = bool(stmt.group_by) or stmt.having is not None or any(
+            isinstance(it, ast.Aggregate) for it in stmt.columns)
+        if grouped:
+            return self._aggregate(stmt, rows, table_of, key_of, ambiguous)
+
         if stmt.order_by is not None:
             okey = key_of(stmt.order_by.column)
             rows.sort(key=lambda ns: (ns.get(okey) is None, ns.get(okey)),
@@ -339,6 +369,110 @@ class Executor:
         columns = [label for label, _ in out]
         projected = [[ns.get(key) for _, key in out] for ns in rows]
         return Result("select", columns=columns, rows=projected)
+
+    # -- aggregation / GROUP BY -------------------------------------------
+    def _aggregate(self, stmt, rows, table_of, key_of, ambiguous):
+        group_cols = stmt.group_by
+        group_keys = [key_of(c) for c in group_cols]
+        group_key_set = set(group_keys)
+
+        # Non-aggregate SELECT columns must be part of GROUP BY.
+        for item in stmt.columns:
+            if isinstance(item, ast.Aggregate):
+                continue
+            if item.name == "*":
+                raise ExecutionError("SELECT * cannot be combined with aggregation")
+            if key_of(item) not in group_key_set:
+                raise ExecutionError(
+                    f"column {item.name!r} must appear in GROUP BY or inside an aggregate")
+
+        # Columns used bare in HAVING must also be grouped.
+        for col in _columns_in(stmt.having):
+            if key_of(col) not in group_key_set:
+                raise ExecutionError(
+                    f"column {col.name!r} in HAVING must appear in GROUP BY or an aggregate")
+
+        # Every aggregate we need to materialize (SELECT + HAVING + ORDER BY).
+        needed: dict[str, ast.Aggregate] = {}
+        for item in stmt.columns:
+            if isinstance(item, ast.Aggregate):
+                needed[item.label] = item
+        for a in _aggregates_in(stmt.having):
+            needed[a.label] = a
+        if stmt.order_by is not None and isinstance(stmt.order_by.column, ast.Aggregate):
+            needed[stmt.order_by.column.label] = stmt.order_by.column
+        for a in needed.values():
+            if a.column.name != "*":
+                table_of(a.column)  # validate the aggregate's argument
+
+        def compute(agg: ast.Aggregate, group: list[dict]) -> Any:
+            if agg.func == "COUNT" and agg.column.name == "*":
+                return len(group)
+            akey = key_of(agg.column)
+            values = [r.get(akey) for r in group]
+            nonnull = [v for v in values if v is not None]
+            if agg.func == "COUNT":
+                return len(nonnull)
+            if not nonnull:
+                return None  # SUM/AVG/MIN/MAX over no rows is NULL
+            if agg.func == "SUM":
+                return sum(nonnull)
+            if agg.func == "AVG":
+                return sum(nonnull) / len(nonnull)
+            if agg.func == "MIN":
+                return min(nonnull)
+            if agg.func == "MAX":
+                return max(nonnull)
+            raise ExecutionError(f"unknown aggregate: {agg.func}")
+
+        # Partition rows into groups (first-seen order preserved).
+        groups: dict[tuple, list[dict]] = {}
+        order: list[tuple] = []
+        for ns in rows:
+            gk = tuple(ns.get(k) for k in group_keys)
+            if gk not in groups:
+                groups[gk] = []
+                order.append(gk)
+            groups[gk].append(ns)
+        # Aggregate with no GROUP BY over an empty table still yields one row.
+        if not group_keys and not order:
+            groups[()] = []
+            order = [()]
+
+        out_rows = []
+        for gk in order:
+            group = groups[gk]
+            gns: dict[str, Any] = {}
+            for col, k in zip(group_cols, group_keys):
+                val = group[0].get(k) if group else None
+                gns[k] = val
+                gns[f"{table_of(col)}.{col.name}"] = val
+                if col.name not in ambiguous:
+                    gns[col.name] = val
+            for label, agg in needed.items():
+                gns[label] = compute(agg, group)
+            if stmt.having is not None and not _passes(stmt.having, gns):
+                continue
+            out_rows.append(gns)
+
+        if stmt.order_by is not None:
+            oc = stmt.order_by.column
+            okey = oc.label if isinstance(oc, ast.Aggregate) else key_of(oc)
+            out_rows.sort(key=lambda ns: (ns.get(okey) is None, ns.get(okey)),
+                          reverse=stmt.order_by.descending)
+        if stmt.limit is not None:
+            out_rows = out_rows[: stmt.limit]
+
+        labels, keys = [], []
+        for item in stmt.columns:
+            if isinstance(item, ast.Aggregate):
+                labels.append(item.label)
+                keys.append(item.label)
+            else:
+                labels.append(item.name)
+                keys.append(key_of(item))
+        projected = [[gns.get(k) for k in keys] for gns in out_rows]
+        return Result("select", columns=labels, rows=projected)
 
     # -- join execution ---------------------------------------------------
     def _apply_join(self, rows, join, inner_schema, txn, ambiguous, key_of):

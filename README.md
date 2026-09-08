@@ -2,17 +2,29 @@
 
 **A small but *real* relational database engine, written from scratch in pure Python — no `sqlite3`, no ORM, no dependencies.**
 
+Use it three ways: as an **embedded library**, through a standard **DB-API 2.0**
+driver (like `sqlite3`), or as a **networked server** many clients share.
+
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-52%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-79%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
 storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, a
 hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
-an index-nested-loop strategy, and **MVCC transactions** with `BEGIN` / `COMMIT`
-/ `ROLLBACK` — in ~2,500 lines of dependency-free, tested Python.
+an index-nested-loop strategy, **aggregation** (`GROUP BY` / `HAVING`),
+**parameterized queries**, and **MVCC transactions** — in ~3,100 lines of
+dependency-free, tested Python. On top of the engine sit a **DB-API 2.0 driver**
+and a **client/server** so applications can actually use it.
+
+> **Where it fits.** minidb is a **SQLite-class** engine: excellent for embedded
+> apps, internal tools, prototypes, tests, teaching, and small shared services.
+> Like SQLite, it serializes writes (one writer at a time) with MVCC snapshot
+> reads. It is **not** a drop-in replacement for Postgres/MySQL at high write
+> concurrency — that (and the roadmap below) is deliberately out of scope. The
+> docs say plainly what it does and doesn't guarantee.
 
 ```text
 minidb> CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);
@@ -80,7 +92,9 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 | Planner | [`engine/planner.py`](minidb/engine/planner.py) | Turns `WHERE` into an index seek / range scan / seq scan + residual filter |
 | Executor | [`engine/executor.py`](minidb/engine/executor.py) | Runs statements, evaluates predicates (3-valued logic), nested-loop + index joins, writes row versions |
 | MVCC | [`txn/mvcc.py`](minidb/txn/mvcc.py) | Version chains, `xmin`/`xmax` visibility, snapshot isolation, vacuum |
-| Facade | [`database.py`](minidb/database.py) | `Database.execute(sql)`, transaction lifecycle, commit/rollback |
+| Facade | [`database.py`](minidb/database.py) | `Database.execute(sql, params)`, transaction lifecycle, commit/rollback |
+| DB-API 2.0 | [`dbapi.py`](minidb/dbapi.py) | PEP 249 driver: `connect`, cursors, `fetch*`, exception hierarchy |
+| Server / Client | [`server.py`](minidb/server.py) · [`client.py`](minidb/client.py) | Threaded TCP server (JSON protocol) + client so many apps share one DB |
 
 There's a fuller write-up in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -122,8 +136,86 @@ db.close()
 
 ```bash
 pip install -e .
-minidb mydata.db      # console entry point
+minidb mydata.db          # interactive shell
+minidb-server mydata.db   # start the TCP server
 ```
+
+## Using it from an application (DB-API 2.0)
+
+minidb ships a [PEP 249](https://peps.python.org/pep-0249/) driver, so it looks
+exactly like `sqlite3` to application code and tooling:
+
+```python
+import minidb.dbapi as db
+
+conn = db.connect("app.db")
+cur = conn.cursor()
+cur.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
+cur.executemany(
+    "INSERT INTO users VALUES (?, ?, ?)",
+    [(1, "ada", "ada@x.io"), (2, "grace", "grace@x.io")],
+)
+conn.commit()
+
+cur.execute("SELECT name FROM users WHERE id = ?", (1,))
+print(cur.fetchone())          # ('ada',)
+conn.close()
+```
+
+`connect`, `Cursor`, `execute` / `executemany`, `fetchone/many/all`,
+`description`, `rowcount`, `commit` / `rollback`, the full PEP 249 exception
+hierarchy (`IntegrityError`, `ProgrammingError`, …), and `with` support are all
+there. Transactions are **not** autocommit, per the spec.
+
+## Parameterized queries (SQL-injection safe)
+
+Values passed as `?` parameters are bound *after* parsing, so user input never
+becomes part of the SQL text — there is no injection surface:
+
+```python
+# the string below is treated purely as data, never as SQL
+cur.execute("SELECT * FROM users WHERE name = ?", ("robert'); DROP TABLE users;--",))
+```
+
+## Aggregation
+
+`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, with `GROUP BY` and `HAVING`:
+
+```sql
+SELECT region, COUNT(*), SUM(amount)
+    FROM sales
+    GROUP BY region
+    HAVING SUM(amount) > 1000
+    ORDER BY SUM(amount) DESC;
+```
+
+`COUNT(col)` and the other aggregates ignore `NULL`s (SQL semantics);
+`COUNT(*)` counts rows.
+
+## Running it as a server
+
+Start the server (embedded in-memory, or backed by a file):
+
+```bash
+minidb-server data.db --host 127.0.0.1 --port 4321
+```
+
+Connect from Python (or any language — the protocol is newline-delimited JSON):
+
+```python
+from minidb.client import connect
+
+c = connect("127.0.0.1", 4321)
+c.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+c.execute("INSERT INTO t VALUES (?, ?)", (1, "hello"))
+print(c.execute("SELECT * FROM t")["rows"])   # [[1, 'hello']]
+c.close()
+```
+
+Many clients share one database. Access is serialized under a global lock (the
+SQLite model), and transactions are per-connection: a client that runs `BEGIN`
+owns the write path until it `COMMIT`s/`ROLLBACK`s (or disconnects, which rolls
+back), while other writers are told the database is locked.
 
 ## Supported SQL
 
@@ -133,11 +225,13 @@ DROP TABLE t;
 
 INSERT INTO t [(cols...)] VALUES (...), (...);
 
-SELECT * | [table.]col, ... | table.*
+SELECT * | [table.]col, ... | table.* | COUNT(*) | SUM(col) | AVG/MIN/MAX(col)
     FROM t
     [ [INNER | LEFT] JOIN other ON <predicate> ]...
     [WHERE <predicate>]
-    [ORDER BY [table.]col [ASC|DESC]]
+    [GROUP BY [table.]col, ...]
+    [HAVING <predicate over aggregates>]
+    [ORDER BY [table.]col | AGG(col) [ASC|DESC]]
     [LIMIT n];
 
 UPDATE t SET col = val, ... [WHERE <predicate>];
@@ -145,6 +239,9 @@ DELETE FROM t [WHERE <predicate>];
 
 BEGIN;  COMMIT;  ROLLBACK;
 EXPLAIN SELECT ...;              -- show the chosen access path
+
+-- values may be passed as ? parameters (bound safely, never interpolated)
+INSERT INTO t VALUES (?, ?);
 ```
 
 - **Types:** `INT`, `FLOAT`, `TEXT`, with `NULL`.
@@ -250,16 +347,17 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 52 tests across every layer
+pytest                    # 79 tests across every layer
 ruff check .              # lint
 ```
 
 The suite covers the B+Tree (including multi-level splits and reopen), the
 tokenizer/parser, end-to-end SQL and constraints, the planner's access-path
-choices, `INNER` / `LEFT` / multi-table joins and ambiguity handling,
-transaction rollback, durability across reopen, MVCC visibility, and both
-crash-recovery directions. CI runs it on Linux and Windows across Python
-3.10–3.12.
+choices, `INNER` / `LEFT` / multi-table joins, aggregation with `GROUP BY` /
+`HAVING`, parameter binding and injection safety, the DB-API 2.0 driver, the
+client/server (including the cross-connection transaction lock), transaction
+rollback, durability across reopen, MVCC visibility, and both crash-recovery
+directions. CI runs it on Linux and Windows across Python 3.10–3.12.
 
 ## Project layout
 
@@ -269,8 +367,9 @@ minidb/
   sql/       tokenizer.py  ast.py  parser.py
   engine/    catalog.py  types.py  planner.py  executor.py
   txn/       mvcc.py
-  database.py  repl.py  __main__.py
-tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py  test_transactions.py
+  database.py  dbapi.py  server.py  client.py  repl.py  __main__.py
+tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py
+             test_aggregation.py  test_dbapi.py  test_server.py  test_transactions.py
 benchmarks/  bench.py
 examples/    demo.py  tour.sql
 docs/        ARCHITECTURE.md
@@ -281,9 +380,9 @@ docs/        ARCHITECTURE.md
 Deliberately out of scope for v0.1, and each a fun next step:
 
 - [ ] Secondary indexes (right now the primary key is the only index)
-- [ ] Multi-writer concurrency with lock/latch management
-- [ ] Aggregation (`GROUP BY`, `COUNT`, `SUM`) and `RIGHT` / `FULL` joins
-- [ ] A hash-join strategy for non-PK equi-joins
+- [ ] Multi-writer concurrency with row/page-level locking (today: serialized writes)
+- [ ] `RIGHT` / `FULL` joins and a hash-join strategy for non-PK equi-joins
+- [ ] More SQL surface: `DISTINCT`, `LIKE`, subqueries, `ALTER TABLE`
 - [ ] B+Tree node merging on delete (leaves currently only split)
 - [ ] Overflow pages for values larger than one page
 - [ ] A cost-based planner using table statistics

@@ -23,7 +23,7 @@ from typing import Optional
 from .engine.catalog import Catalog
 from .engine.executor import Executor, Result
 from .sql import ast
-from .sql.parser import parse
+from .sql.parser import bind_parameters, parse
 from .storage.pager import Pager
 from .storage.wal import WAL
 from .txn.mvcc import Transaction, TransactionManager
@@ -53,8 +53,14 @@ class Database:
         self.current_txn: Optional[Transaction] = None
 
     # -- public API --------------------------------------------------------
-    def execute(self, sql: str) -> Result:
+    def execute(self, sql: str, params: tuple = ()) -> Result:
+        """Run one SQL statement.
+
+        ``params`` fills ``?`` placeholders positionally; values are bound after
+        parsing, so user data never becomes part of the SQL text (no injection).
+        """
         stmt = parse(sql)
+        stmt = bind_parameters(stmt, list(params))
 
         if isinstance(stmt, ast.Begin):
             if self.current_txn is not None:

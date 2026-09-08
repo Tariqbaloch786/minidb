@@ -24,4 +24,4 @@ from .database import Database
 from .engine.executor import Result
 
 __all__ = ["Database", "Result"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

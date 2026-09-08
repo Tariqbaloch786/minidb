@@ -38,6 +38,15 @@ def main():
     show(db, "SELECT employees.name, orders.amount FROM employees "
              "LEFT JOIN orders ON orders.emp_id = employees.id ORDER BY employees.id")
 
+    print("\n--- aggregation ---")
+    show(db, "SELECT emp_id, COUNT(*), SUM(amount) FROM orders GROUP BY emp_id "
+             "HAVING SUM(amount) > 400 ORDER BY SUM(amount) DESC")
+
+    print("\n--- parameterized query (injection-safe) ---")
+    r = db.execute("SELECT name FROM employees WHERE dept = ?", ("Eng",))
+    print(">>> SELECT name FROM employees WHERE dept = ?   params=('Eng',)")
+    print("   ", [row[0] for row in r.rows])
+
     print("\n--- transaction that gets rolled back ---")
     show(db, "BEGIN")
     show(db, "UPDATE employees SET salary = 0 WHERE dept = 'Eng'")

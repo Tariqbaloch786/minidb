@@ -24,6 +24,28 @@ class Literal:
 
 
 @dataclass
+class Parameter:
+    """A ``?`` placeholder, bound positionally from the params sequence."""
+
+    index: int
+
+
+@dataclass
+class Aggregate:
+    """An aggregate function call, e.g. ``COUNT(*)`` or ``SUM(amount)``."""
+
+    func: str  # COUNT | SUM | AVG | MIN | MAX
+    column: "Column"  # name may be "*" (only valid for COUNT)
+
+    @property
+    def label(self) -> str:
+        arg = "*" if self.column.name == "*" else (
+            self.column.name if self.column.table is None
+            else f"{self.column.table}.{self.column.name}")
+        return f"{self.func.lower()}({arg})"
+
+
+@dataclass
 class BinOp:
     op: str  # = != < <= > >= AND OR NOT
     left: Any
@@ -74,9 +96,11 @@ class Join:
 @dataclass
 class Select:
     table: str  # the base (left-most) table in FROM
-    columns: list[Column]  # each item is a Column; name may be "*"
+    columns: list[Any]  # Column or Aggregate items (Column.name may be "*")
     joins: list[Join] = field(default_factory=list)
     where: Optional[Any] = None
+    group_by: list[Column] = field(default_factory=list)
+    having: Optional[Any] = None
     order_by: Optional[OrderBy] = None
     limit: Optional[int] = None
     explain: bool = False

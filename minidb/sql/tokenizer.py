@@ -9,11 +9,11 @@ KEYWORDS = {
     "where", "update", "set", "delete", "begin", "commit", "rollback", "and",
     "or", "not", "null", "primary", "key", "int", "integer", "text", "float",
     "order", "by", "asc", "desc", "limit", "true", "false", "explain",
-    "join", "inner", "left", "right", "outer", "on",
+    "join", "inner", "left", "right", "outer", "on", "group", "having",
 }
 
 _SYMBOLS = {
-    "(", ")", ",", ";", "*", "=", "<", ">", "<=", ">=", "!=", "<>", ".",
+    "(", ")", ",", ";", "*", "=", "<", ">", "<=", ">=", "!=", "<>", ".", "?",
 }
 
 

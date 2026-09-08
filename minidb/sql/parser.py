@@ -29,10 +29,14 @@ class ParseError(ValueError):
 _COMPARATORS = {"=", "!=", "<>", "<", "<=", ">", ">="}
 
 
+_AGG_FUNCS = {"COUNT", "SUM", "AVG", "MIN", "MAX"}
+
+
 class Parser:
     def __init__(self, sql: str):
         self.tokens = tokenize(sql)
         self.pos = 0
+        self._param_count = 0
 
     # -- token helpers -----------------------------------------------------
     @property
@@ -195,11 +199,23 @@ class Parser:
         if self.at_kw("where"):
             self.advance()
             where = self._expr()
+        group_by = []
+        if self.at_kw("group"):
+            self.advance()
+            self.expect_kw("by")
+            group_by = [self._column_ref()]
+            while self.at_sym(","):
+                self.advance()
+                group_by.append(self._column_ref())
+        having = None
+        if self.at_kw("having"):
+            self.advance()
+            having = self._expr()
         order_by = None
         if self.at_kw("order"):
             self.advance()
             self.expect_kw("by")
-            col = self._column_ref()
+            col = self._agg_or_column()
             desc = False
             if self.at_kw("asc"):
                 self.advance()
@@ -213,9 +229,14 @@ class Parser:
             if self.cur.kind != "number":
                 raise ParseError("LIMIT expects a number")
             limit = int(self.advance().value)
-        return ast.Select(table, columns, joins, where, order_by, limit)
+        return ast.Select(table, columns, joins=joins, where=where,
+                          group_by=group_by, having=having,
+                          order_by=order_by, limit=limit)
 
-    def _select_item(self) -> ast.Column:
+    def _select_item(self):
+        agg = self._maybe_aggregate()
+        if agg is not None:
+            return agg
         if self.at_sym("*"):
             self.advance()
             return ast.Column("*", None)
@@ -227,6 +248,24 @@ class Parser:
                 return ast.Column("*", first)
             return ast.Column(self.expect_ident(), first)
         return ast.Column(first, None)
+
+    def _maybe_aggregate(self):
+        t = self.cur
+        nxt = self.tokens[self.pos + 1]
+        if (t.kind == "ident" and t.value.upper() in _AGG_FUNCS
+                and nxt.kind == "symbol" and nxt.value == "("):
+            func = self.advance().value.upper()
+            self.expect_sym("(")
+            if self.at_sym("*"):
+                self.advance()
+                col = ast.Column("*", None)
+            else:
+                col = self._column_ref()
+            self.expect_sym(")")
+            if func != "COUNT" and col.name == "*":
+                raise ParseError(f"{func}(*) is not allowed; use {func}(column)")
+            return ast.Aggregate(func, col)
+        return None
 
     def _join(self) -> ast.Join:
         kind = "INNER"
@@ -315,7 +354,10 @@ class Parser:
         return ast.BinOp(op, left, right)
 
     def _operand(self) -> Any:
-        """One side of a comparison: a column reference or a literal."""
+        """One side of a comparison: an aggregate, column reference, or literal."""
+        agg = self._maybe_aggregate()
+        if agg is not None:
+            return agg
         if self.cur.kind == "ident":
             return self._column_ref()
         return self._literal()
@@ -327,8 +369,17 @@ class Parser:
             return ast.Column(self.expect_ident(), first)
         return ast.Column(first, None)
 
-    def _literal(self) -> ast.Literal:
+    def _agg_or_column(self):
+        agg = self._maybe_aggregate()
+        return agg if agg is not None else self._column_ref()
+
+    def _literal(self):
         t = self.cur
+        if self.at_sym("?"):
+            self.advance()
+            idx = self._param_count
+            self._param_count += 1
+            return ast.Parameter(idx)
         if t.kind == "number":
             self.advance()
             return ast.Literal(float(t.value) if "." in t.value else int(t.value))
@@ -349,3 +400,74 @@ class Parser:
 
 def parse(sql: str) -> Any:
     return Parser(sql).parse()
+
+
+# -- parameter binding -----------------------------------------------------
+def _sub_expr(expr: Any, params) -> Any:
+    if isinstance(expr, ast.Parameter):
+        if expr.index >= len(params):
+            raise ParseError("not enough parameters supplied for placeholders")
+        return ast.Literal(params[expr.index])
+    if isinstance(expr, ast.BinOp):
+        expr.left = _sub_expr(expr.left, params)
+        expr.right = _sub_expr(expr.right, params)
+    return expr
+
+
+def count_parameters(stmt: Any) -> int:
+    """Number of ``?`` placeholders in a parsed statement."""
+    total = 0
+
+    def walk(expr):
+        nonlocal total
+        if isinstance(expr, ast.Parameter):
+            total += 1
+        elif isinstance(expr, ast.BinOp):
+            walk(expr.left)
+            walk(expr.right)
+
+    if isinstance(stmt, ast.Insert):
+        for row in stmt.rows:
+            for v in row:
+                walk(v)
+    elif isinstance(stmt, ast.Update):
+        for _, v in stmt.assignments:
+            walk(v)
+        walk(stmt.where)
+    elif isinstance(stmt, ast.Select):
+        walk(stmt.where)
+        walk(stmt.having)
+        for j in stmt.joins:
+            walk(j.on)
+    elif isinstance(stmt, ast.Delete):
+        walk(stmt.where)
+    return total
+
+
+def bind_parameters(stmt: Any, params) -> Any:
+    """Replace ``?`` placeholders in ``stmt`` with literal values from ``params``.
+
+    Parameterized queries are the safe way to pass user data into SQL: values
+    never touch the SQL text, so there is no SQL-injection surface.
+    """
+    expected = count_parameters(stmt)
+    if len(params) != expected:
+        raise ParseError(
+            f"query has {expected} placeholder(s) but {len(params)} parameter(s) given")
+    if isinstance(stmt, ast.Insert):
+        stmt.rows = [[_sub_expr(v, params) for v in row] for row in stmt.rows]
+    elif isinstance(stmt, ast.Update):
+        stmt.assignments = [(c, _sub_expr(v, params)) for c, v in stmt.assignments]
+        if stmt.where is not None:
+            stmt.where = _sub_expr(stmt.where, params)
+    elif isinstance(stmt, ast.Select):
+        if stmt.where is not None:
+            stmt.where = _sub_expr(stmt.where, params)
+        if stmt.having is not None:
+            stmt.having = _sub_expr(stmt.having, params)
+        for j in stmt.joins:
+            j.on = _sub_expr(j.on, params)
+    elif isinstance(stmt, ast.Delete):
+        if stmt.where is not None:
+            stmt.where = _sub_expr(stmt.where, params)
+    return stmt

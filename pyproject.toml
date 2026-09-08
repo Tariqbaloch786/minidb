@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minidb"
-version = "0.1.0"
-description = "A small but real relational database engine, written from scratch in pure Python (B+Tree storage, write-ahead log, SQL parser, query planner, MVCC transactions)."
+version = "0.2.0"
+description = "A small but real relational database engine in pure Python: B+Tree storage, write-ahead log, SQL parser + planner, joins, aggregation, MVCC transactions, a DB-API 2.0 driver, and a client/server mode."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -29,6 +29,7 @@ Source = "https://github.com/Tariqbaloch786/minidb"
 
 [project.scripts]
 minidb = "minidb.repl:main"
+minidb-server = "minidb.server:main"
 
 [tool.setuptools]
 packages = ["minidb", "minidb.storage", "minidb.sql", "minidb.engine", "minidb.txn"]
