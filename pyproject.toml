@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minidb"
+version = "0.1.0"
+description = "A small but real relational database engine, written from scratch in pure Python (B+Tree storage, write-ahead log, SQL parser, query planner, MVCC transactions)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Tariq Baloch" }]
+keywords = ["database", "sql", "btree", "wal", "mvcc", "storage-engine", "dbms"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Database Engines/Servers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[project.urls]
+Homepage = "https://github.com/Tariqbaloch786/minidb"
+Source = "https://github.com/Tariqbaloch786/minidb"
+
+[project.scripts]
+minidb = "minidb.repl:main"
+
+[tool.setuptools]
+packages = ["minidb", "minidb.storage", "minidb.sql", "minidb.engine", "minidb.txn"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

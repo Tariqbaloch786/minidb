@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Testing / tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# minidb data files
+*.db
+*.db.wal
+demo.db*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
