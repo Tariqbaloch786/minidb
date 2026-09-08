@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
 # -- expressions -----------------------------------------------------------
 @dataclass
 class Column:
+    """A column reference. ``table`` is the optional qualifier in ``t.col``.
+
+    ``name == "*"`` represents a star: ``*`` (table is None) or ``t.*``.
+    """
+
     name: str
+    table: Optional[str] = None
 
 
 @dataclass
@@ -19,7 +25,7 @@ class Literal:
 
 @dataclass
 class BinOp:
-    op: str  # = != < <= > >= AND OR
+    op: str  # = != < <= > >= AND OR NOT
     left: Any
     right: Any
 
@@ -54,14 +60,22 @@ class Insert:
 
 @dataclass
 class OrderBy:
-    column: str
+    column: Column
     descending: bool = False
 
 
 @dataclass
-class Select:
+class Join:
     table: str
-    columns: list[str]  # ['*'] or explicit column names
+    on: Any  # a predicate expression evaluated against the joined row
+    kind: str = "INNER"  # INNER | LEFT
+
+
+@dataclass
+class Select:
+    table: str  # the base (left-most) table in FROM
+    columns: list[Column]  # each item is a Column; name may be "*"
+    joins: list[Join] = field(default_factory=list)
     where: Optional[Any] = None
     order_by: Optional[OrderBy] = None
     limit: Optional[int] = None

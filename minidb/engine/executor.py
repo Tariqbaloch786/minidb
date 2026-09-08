@@ -8,6 +8,7 @@ writes new row versions on ``INSERT`` / ``UPDATE`` / ``DELETE``.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -41,7 +42,8 @@ def _eval(expr: Any, row: dict[str, Any]) -> Optional[bool] | Any:
     if isinstance(expr, ast.Literal):
         return expr.value
     if isinstance(expr, ast.Column):
-        return row.get(expr.name)
+        key = expr.name if expr.table is None else f"{expr.table}.{expr.name}"
+        return row.get(key)
     if isinstance(expr, ast.BinOp):
         op = expr.op
         if op == "AND":
@@ -94,6 +96,55 @@ def _passes(where: Optional[Any], row: dict[str, Any]) -> bool:
     if where is None:
         return True
     return _truth(_eval(where, row)) is True
+
+
+# -- join / namespace helpers ----------------------------------------------
+def _multi_ns(table: str, schema: TableSchema, row: dict[str, Any],
+              ambiguous: frozenset) -> dict[str, Any]:
+    """Build an evaluation namespace: qualified ``table.col`` keys always, and
+    bare ``col`` keys only for names that are unambiguous across the join."""
+    ns: dict[str, Any] = {}
+    for cname, _ in schema.columns:
+        val = row.get(cname)
+        ns[f"{table}.{cname}"] = val
+        if cname not in ambiguous:
+            ns[cname] = val
+    return ns
+
+
+def _columns_in(expr: Any):
+    if isinstance(expr, ast.Column):
+        yield expr
+    elif isinstance(expr, ast.BinOp):
+        yield from _columns_in(expr.left)
+        yield from _columns_in(expr.right)
+
+
+def _flatten_and(expr: Any) -> list[Any]:
+    if isinstance(expr, ast.BinOp) and expr.op == "AND":
+        return _flatten_and(expr.left) + _flatten_and(expr.right)
+    return [expr]
+
+
+def _and_of(conjuncts: list[Any]) -> Optional[Any]:
+    if not conjuncts:
+        return None
+    node = conjuncts[0]
+    for c in conjuncts[1:]:
+        node = ast.BinOp("AND", node, c)
+    return node
+
+
+def _conjuncts_for_table(where: Optional[Any], table: str, table_of) -> Optional[Any]:
+    """The AND-conjuncts of ``where`` that reference only ``table`` (for pushdown)."""
+    if where is None:
+        return None
+    kept = []
+    for c in _flatten_and(where):
+        cols = list(_columns_in(c))
+        if cols and all(table_of(col) == table for col in cols):
+            kept.append(c)
+    return _and_of(kept)
 
 
 class Executor:
@@ -209,39 +260,176 @@ class Executor:
             if version is None:
                 continue
             row = types.deserialize_row(schema.columns, version.data)
-            if _passes(plan.residual, row):
+            if _passes(plan.residual, _multi_ns(schema.name, schema, row, frozenset())):
                 yield pk, row, version
 
-    # -- SELECT ------------------------------------------------------------
+    # -- SELECT (single table or joins) -----------------------------------
     def _select(self, stmt: ast.Select, txn: Transaction) -> Result:
-        schema = self._require_table(stmt.table)
-        plan = planner.plan_scan(stmt.table, schema.pk, stmt.where)
+        base_schema = self._require_table(stmt.table)
+        table_list = [(stmt.table, base_schema)]
+        for j in stmt.joins:
+            table_list.append((j.table, self._require_table(j.table)))
+        if len({t for t, _ in table_list}) != len(table_list):
+            raise ExecutionError("a table may not appear twice in FROM/JOIN "
+                                 "(aliases are not supported yet)")
+        schemas = {t: s for t, s in table_list}
+        counts = Counter(c for _, s in table_list for c, _ in s.columns)
+        ambiguous = frozenset(n for n, c in counts.items() if c > 1)
+
+        def table_of(col: ast.Column) -> str:
+            if col.table is not None:
+                if col.table not in schemas:
+                    raise ExecutionError(f"unknown table qualifier: {col.table}")
+                if col.name != "*" and not schemas[col.table].has_column(col.name):
+                    raise ExecutionError(f"no such column: {col.table}.{col.name}")
+                return col.table
+            if col.name in ambiguous:
+                raise ExecutionError(
+                    f"ambiguous column: {col.name} (qualify it with a table name)")
+            for t, s in table_list:
+                if s.has_column(col.name):
+                    return t
+            raise ExecutionError(f"no such column: {col.name}")
+
+        def key_of(col: ast.Column) -> str:
+            t = table_of(col)
+            return col.name if col.table is None else f"{t}.{col.name}"
+
+        # Validate every column reference up front (clear errors + safe eval).
+        for col in _columns_in(stmt.where):
+            table_of(col)
+        for j in stmt.joins:
+            for col in _columns_in(j.on):
+                table_of(col)
+        if stmt.order_by is not None:
+            table_of(stmt.order_by.column)
+        for item in stmt.columns:
+            if item.name == "*":
+                if item.table is not None and item.table not in schemas:
+                    raise ExecutionError(f"unknown table qualifier: {item.table}")
+            else:
+                table_of(item)
+
+        # Push WHERE conjuncts that only touch the base table into its scan.
+        base_where = _conjuncts_for_table(stmt.where, stmt.table, table_of)
+        base_plan = planner.plan_scan(stmt.table, base_schema.pk, base_where)
 
         if stmt.explain:
-            return Result("explain", columns=["QUERY PLAN"], rows=[[plan.describe()]])
+            return Result("explain", columns=["QUERY PLAN"],
+                          rows=self._explain_rows(stmt, table_list, base_plan, key_of))
 
-        if stmt.columns == ["*"]:
-            out_cols = schema.column_names
-        else:
-            for c in stmt.columns:
-                if not schema.has_column(c):
-                    raise ExecutionError(f"no such column: {c}")
-            out_cols = stmt.columns
+        rows = [
+            _multi_ns(stmt.table, base_schema, row, ambiguous)
+            for _, row, _ in self._scan(base_schema, base_plan, txn)
+        ]
+        for j in stmt.joins:
+            rows = self._apply_join(rows, j, schemas[j.table], txn, ambiguous, key_of)
 
-        rows = [row for _, row, _ in self._scan(schema, plan, txn)]
+        # Residual WHERE (join-spanning / non-base predicates) over joined rows.
+        rows = [ns for ns in rows if _passes(stmt.where, ns)]
 
         if stmt.order_by is not None:
-            col = stmt.order_by.column
-            if not schema.has_column(col):
-                raise ExecutionError(f"no such column: {col}")
-            rows.sort(key=lambda r: (r.get(col) is None, r.get(col)),
+            okey = key_of(stmt.order_by.column)
+            rows.sort(key=lambda ns: (ns.get(okey) is None, ns.get(okey)),
                       reverse=stmt.order_by.descending)
-
         if stmt.limit is not None:
             rows = rows[: stmt.limit]
 
-        projected = [[r.get(c) for c in out_cols] for r in rows]
-        return Result("select", columns=out_cols, rows=projected)
+        out = self._projection(stmt.columns, table_list, ambiguous)
+        columns = [label for label, _ in out]
+        projected = [[ns.get(key) for _, key in out] for ns in rows]
+        return Result("select", columns=columns, rows=projected)
+
+    # -- join execution ---------------------------------------------------
+    def _apply_join(self, rows, join, inner_schema, txn, ambiguous, key_of):
+        """Nested-loop join; uses an index seek on the inner table when the ON
+        clause is an equi-join against the inner primary key."""
+        drive = self._equijoin_drive(join, inner_schema, key_of)
+        out = []
+        for outer in rows:
+            matched = False
+            for inner_row in self._inner_candidates(join, inner_schema, outer, txn, drive):
+                combined = dict(outer)
+                for cname, _ in inner_schema.columns:
+                    val = inner_row.get(cname)
+                    combined[f"{join.table}.{cname}"] = val
+                    if cname not in ambiguous:
+                        combined[cname] = val
+                if _passes(join.on, combined):
+                    out.append(combined)
+                    matched = True
+            if join.kind == "LEFT" and not matched:
+                combined = dict(outer)
+                for cname, _ in inner_schema.columns:
+                    combined[f"{join.table}.{cname}"] = None
+                    if cname not in ambiguous:
+                        combined[cname] = None
+                out.append(combined)
+        return out
+
+    def _inner_candidates(self, join, inner_schema, outer, txn, drive):
+        if drive is not None:
+            val = outer.get(drive)
+            if isinstance(val, int) and not isinstance(val, bool):
+                plan = planner.Plan(join.table, planner.INDEX_SEEK, inner_schema.pk,
+                                    seek_key=val, residual=None)
+                return [row for _, row, _ in self._scan(inner_schema, plan, txn)]
+            return []  # a non-int value cannot equal an INT primary key
+        plan = planner.Plan(join.table, planner.SEQ_SCAN, inner_schema.pk, residual=None)
+        return [row for _, row, _ in self._scan(inner_schema, plan, txn)]
+
+    def _equijoin_drive(self, join, inner_schema, key_of):
+        """If ON contains ``<outer> = <inner.pk>``, return the outer side's key."""
+        for c in _flatten_and(join.on):
+            if not (isinstance(c, ast.BinOp) and c.op == "="):
+                continue
+            for a, b in ((c.left, c.right), (c.right, c.left)):
+                if (isinstance(a, ast.Column) and isinstance(b, ast.Column)
+                        and self._is_inner_pk(a, join.table, inner_schema)
+                        and not self._is_inner_pk(b, join.table, inner_schema)):
+                    return key_of(b)
+        return None
+
+    @staticmethod
+    def _is_inner_pk(col, inner_table, inner_schema):
+        if col.name != inner_schema.pk:
+            return False
+        return col.table == inner_table or col.table is None
+
+    @staticmethod
+    def _projection(items, table_list, ambiguous):
+        schemas = {t: s for t, s in table_list}
+        out = []
+        for item in items:
+            if item.name == "*" and item.table is None:
+                for t, s in table_list:
+                    for cname, _ in s.columns:
+                        label = cname if cname not in ambiguous else f"{t}.{cname}"
+                        out.append((label, f"{t}.{cname}"))
+            elif item.name == "*":  # table.*
+                for cname, _ in schemas[item.table].columns:
+                    label = cname if cname not in ambiguous else f"{item.table}.{cname}"
+                    out.append((label, f"{item.table}.{cname}"))
+            else:
+                key = item.name if item.table is None else f"{item.table}.{item.name}"
+                out.append((item.name, key))
+        return out
+
+    def _explain_rows(self, stmt, table_list, base_plan, key_of):
+        if not stmt.joins:
+            return [[base_plan.describe()]]
+        schemas = {t: s for t, s in table_list}
+        rows = [["Nested Loop Join"], ["  -> " + base_plan.describe()]]
+        for j in stmt.joins:
+            inner_schema = schemas[j.table]
+            drive = self._equijoin_drive(j, inner_schema, key_of)
+            if drive is not None:
+                access = (f"Index Seek on {j.table}_pkey "
+                          f"({j.table}.{inner_schema.pk} = {drive}) [per outer row]")
+            else:
+                access = f"Seq Scan on {j.table} [per outer row]"
+            rows.append([f"  -> {j.kind} Join  {access}"])
+        return rows
 
     # -- UPDATE ------------------------------------------------------------
     def _update(self, stmt: ast.Update, txn: Transaction) -> Result:

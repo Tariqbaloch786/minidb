@@ -25,6 +25,20 @@ EXPLAIN SELECT * FROM employees WHERE id >= 2 AND id <= 3;
 -- Filter on a non-key column -> Seq Scan with a residual filter.
 SELECT name, salary FROM employees WHERE salary > 160000 ORDER BY salary DESC;
 
+-- Joins. The ON clause is an equi-join on the inner table's primary key, so
+-- the planner uses an index nested-loop join (a PK seek per outer row).
+CREATE TABLE projects (id INT PRIMARY KEY, owner_id INT, title TEXT);
+INSERT INTO projects VALUES (100, 1, 'Analytical Engine'), (101, 4, 'AGC');
+EXPLAIN SELECT * FROM projects JOIN employees ON projects.owner_id = employees.id;
+SELECT employees.name, projects.title
+    FROM projects JOIN employees ON projects.owner_id = employees.id
+    ORDER BY projects.id;
+
+-- LEFT JOIN keeps employees with no project (title comes back NULL).
+SELECT employees.name, projects.title
+    FROM employees LEFT JOIN projects ON projects.owner_id = employees.id
+    ORDER BY employees.id;
+
 -- Transactions: this change is rolled back and never persists.
 BEGIN;
 UPDATE employees SET salary = 0 WHERE dept = 'Engineering';

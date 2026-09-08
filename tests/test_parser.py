@@ -46,11 +46,32 @@ def test_parse_insert_multirow():
 
 def test_parse_select_full():
     stmt = parse("SELECT a, b FROM t WHERE a >= 1 AND b < 5 ORDER BY a DESC LIMIT 10")
-    assert stmt.columns == ["a", "b"]
+    assert [c.name for c in stmt.columns] == ["a", "b"]
+    assert stmt.order_by.column.name == "a"
     assert stmt.order_by.descending
     assert stmt.limit == 10
     assert isinstance(stmt.where, ast.BinOp)
     assert stmt.where.op == "AND"
+
+
+def test_parse_join():
+    stmt = parse(
+        "SELECT users.name, orders.total FROM users "
+        "JOIN orders ON users.id = orders.user_id WHERE orders.total > 100"
+    )
+    assert len(stmt.joins) == 1
+    join = stmt.joins[0]
+    assert join.table == "orders"
+    assert join.kind == "INNER"
+    assert isinstance(join.on, ast.BinOp) and join.on.op == "="
+    # qualified column references survive parsing
+    assert stmt.columns[0].table == "users" and stmt.columns[0].name == "name"
+
+
+def test_parse_left_join_and_star():
+    stmt = parse("SELECT a.*, b.id FROM a LEFT JOIN b ON a.id = b.a_id")
+    assert stmt.joins[0].kind == "LEFT"
+    assert stmt.columns[0].name == "*" and stmt.columns[0].table == "a"
 
 
 def test_parse_negative_and_float_numbers():

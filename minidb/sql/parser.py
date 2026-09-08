@@ -182,16 +182,15 @@ class Parser:
 
     def _select(self) -> ast.Select:
         self.expect_kw("select")
-        if self.at_sym("*"):
+        columns = [self._select_item()]
+        while self.at_sym(","):
             self.advance()
-            columns = ["*"]
-        else:
-            columns = [self.expect_ident()]
-            while self.at_sym(","):
-                self.advance()
-                columns.append(self.expect_ident())
+            columns.append(self._select_item())
         self.expect_kw("from")
         table = self.expect_ident()
+        joins = []
+        while self.at_kw("join", "inner", "left", "right"):
+            joins.append(self._join())
         where = None
         if self.at_kw("where"):
             self.advance()
@@ -200,7 +199,7 @@ class Parser:
         if self.at_kw("order"):
             self.advance()
             self.expect_kw("by")
-            col = self.expect_ident()
+            col = self._column_ref()
             desc = False
             if self.at_kw("asc"):
                 self.advance()
@@ -214,7 +213,37 @@ class Parser:
             if self.cur.kind != "number":
                 raise ParseError("LIMIT expects a number")
             limit = int(self.advance().value)
-        return ast.Select(table, columns, where, order_by, limit)
+        return ast.Select(table, columns, joins, where, order_by, limit)
+
+    def _select_item(self) -> ast.Column:
+        if self.at_sym("*"):
+            self.advance()
+            return ast.Column("*", None)
+        first = self.expect_ident()
+        if self.at_sym("."):
+            self.advance()
+            if self.at_sym("*"):
+                self.advance()
+                return ast.Column("*", first)
+            return ast.Column(self.expect_ident(), first)
+        return ast.Column(first, None)
+
+    def _join(self) -> ast.Join:
+        kind = "INNER"
+        if self.at_kw("inner"):
+            self.advance()
+        elif self.at_kw("left"):
+            self.advance()
+            if self.at_kw("outer"):
+                self.advance()
+            kind = "LEFT"
+        elif self.at_kw("right"):
+            raise ParseError("RIGHT JOIN is not supported yet")
+        self.expect_kw("join")
+        table = self.expect_ident()
+        self.expect_kw("on")
+        on = self._expr()
+        return ast.Join(table, on, kind)
 
     def _update(self) -> ast.Update:
         self.expect_kw("update")
@@ -276,14 +305,27 @@ class Parser:
             inner = self._expr()
             self.expect_sym(")")
             return inner
-        left = ast.Column(self.expect_ident())
+        left = self._operand()
         if not (self.cur.kind == "symbol" and self.cur.value in _COMPARATORS):
             raise ParseError(f"expected comparator, got {self.cur.value!r}")
         op = self.advance().value
         if op == "<>":
             op = "!="
-        right = self._literal()
+        right = self._operand()
         return ast.BinOp(op, left, right)
+
+    def _operand(self) -> Any:
+        """One side of a comparison: a column reference or a literal."""
+        if self.cur.kind == "ident":
+            return self._column_ref()
+        return self._literal()
+
+    def _column_ref(self) -> ast.Column:
+        first = self.expect_ident()
+        if self.at_sym("."):
+            self.advance()
+            return ast.Column(self.expect_ident(), first)
+        return ast.Column(first, None)
 
     def _literal(self) -> ast.Literal:
         t = self.cur

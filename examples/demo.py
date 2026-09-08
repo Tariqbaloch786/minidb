@@ -29,6 +29,15 @@ def main():
     show(db, "EXPLAIN SELECT * FROM employees WHERE id = 2")
     show(db, "SELECT name, salary FROM employees WHERE salary > 160000 ORDER BY salary DESC")
 
+    print("\n--- joins ---")
+    show(db, "CREATE TABLE orders (id INT PRIMARY KEY, emp_id INT, amount INT)")
+    show(db, "INSERT INTO orders VALUES (10, 1, 500), (11, 1, 300), (12, 2, 900)")
+    show(db, "EXPLAIN SELECT * FROM orders JOIN employees ON orders.emp_id = employees.id")
+    show(db, "SELECT employees.name, orders.amount FROM employees "
+             "JOIN orders ON orders.emp_id = employees.id ORDER BY orders.amount DESC")
+    show(db, "SELECT employees.name, orders.amount FROM employees "
+             "LEFT JOIN orders ON orders.emp_id = employees.id ORDER BY employees.id")
+
     print("\n--- transaction that gets rolled back ---")
     show(db, "BEGIN")
     show(db, "UPDATE employees SET salary = 0 WHERE dept = 'Eng'")

@@ -97,6 +97,29 @@ grammar is easy to read and extend.
   residual predicate (with three-valued logic), and writes new row versions on
   `INSERT` / `UPDATE` / `DELETE`.
 
+### Joins
+
+`SELECT` may join several tables. The executor builds each intermediate row as a
+**namespace** keyed by qualified `table.col` names (plus bare `col` names when
+they're unambiguous across the join, so unqualified references still work and
+ambiguous ones raise a clear error). Every column reference is validated up
+front against that namespace.
+
+Joins run as **nested loops**, left to right. Two optimizations make them more
+than a naive cartesian product:
+
+1. **Predicate pushdown** — `WHERE` conjuncts that mention only the base table
+   are handed to the base table's access path, so an indexable base filter still
+   becomes a seek.
+2. **Index nested-loop join** — when a join's `ON` clause is an equi-join
+   against the inner table's primary key (`outer.x = inner.pk`), the inner side
+   is a B+Tree **seek per outer row** instead of a full scan. `EXPLAIN` labels
+   this `Index Seek on <inner>_pkey ... [per outer row]`.
+
+`LEFT JOIN` emits the outer row with the inner columns set to `NULL` when no
+inner row matches. `RIGHT` / `FULL` joins and a hash-join strategy for non-PK
+equi-joins are future work.
+
 ## 6. Transactions and MVCC (`txn/mvcc.py`)
 
 Instead of a single value, each key maps to a **version chain**: a list of

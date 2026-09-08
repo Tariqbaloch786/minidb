@@ -5,14 +5,14 @@
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-39%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-52%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
 storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, a
-hand-written **SQL parser**, a **query planner**, and **MVCC transactions** with
-`BEGIN` / `COMMIT` / `ROLLBACK` — in ~2,000 lines of dependency-free, tested
-Python.
+hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
+an index-nested-loop strategy, and **MVCC transactions** with `BEGIN` / `COMMIT`
+/ `ROLLBACK` — in ~2,500 lines of dependency-free, tested Python.
 
 ```text
 minidb> CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT);
@@ -78,7 +78,7 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 | Tokenizer/Parser | [`sql/`](minidb/sql/) | Hand-written lexer + recursive-descent parser → typed AST |
 | Catalog | [`engine/catalog.py`](minidb/engine/catalog.py) | Table schemas, persisted inside the DB file |
 | Planner | [`engine/planner.py`](minidb/engine/planner.py) | Turns `WHERE` into an index seek / range scan / seq scan + residual filter |
-| Executor | [`engine/executor.py`](minidb/engine/executor.py) | Runs statements, evaluates predicates (3-valued logic), writes row versions |
+| Executor | [`engine/executor.py`](minidb/engine/executor.py) | Runs statements, evaluates predicates (3-valued logic), nested-loop + index joins, writes row versions |
 | MVCC | [`txn/mvcc.py`](minidb/txn/mvcc.py) | Version chains, `xmin`/`xmax` visibility, snapshot isolation, vacuum |
 | Facade | [`database.py`](minidb/database.py) | `Database.execute(sql)`, transaction lifecycle, commit/rollback |
 
@@ -133,10 +133,11 @@ DROP TABLE t;
 
 INSERT INTO t [(cols...)] VALUES (...), (...);
 
-SELECT * | col, ...
+SELECT * | [table.]col, ... | table.*
     FROM t
+    [ [INNER | LEFT] JOIN other ON <predicate> ]...
     [WHERE <predicate>]
-    [ORDER BY col [ASC|DESC]]
+    [ORDER BY [table.]col [ASC|DESC]]
     [LIMIT n];
 
 UPDATE t SET col = val, ... [WHERE <predicate>];
@@ -147,7 +148,8 @@ EXPLAIN SELECT ...;              -- show the chosen access path
 ```
 
 - **Types:** `INT`, `FLOAT`, `TEXT`, with `NULL`.
-- **Predicates:** `=  !=  <  <=  >  >=`, combined with `AND` / `OR` / `NOT` and parentheses, evaluated with proper SQL three-valued logic (a comparison against `NULL` is *unknown*, not false).
+- **Predicates:** `=  !=  <  <=  >  >=` (column-to-literal *and* column-to-column), combined with `AND` / `OR` / `NOT` and parentheses, evaluated with proper SQL three-valued logic (a comparison against `NULL` is *unknown*, not false).
+- **Joins:** `INNER` and `LEFT` joins, chainable across many tables, with `table.column` qualification and ambiguous-name detection.
 - **Constraints:** exactly one `INT PRIMARY KEY` (it *is* the clustered B+Tree key), plus `NOT NULL`.
 
 ## The query planner in action
@@ -167,6 +169,36 @@ The planner splits a `WHERE` clause into conjuncts, pushes any primary-key
 bounds down into a B+Tree seek or range scan, and keeps the rest as a residual
 filter. That single optimization is the difference between the two numbers
 below.
+
+## Joins
+
+`INNER` and `LEFT` joins work, chainable across any number of tables, with
+`table.column` qualification (and an error if you leave an ambiguous name
+unqualified):
+
+```sql
+SELECT users.name, orders.total
+    FROM users
+    JOIN orders ON users.id = orders.user_id
+    WHERE orders.total >= 100
+    ORDER BY orders.total DESC;
+
+-- LEFT JOIN keeps users who have never ordered, with NULLs on the right side
+SELECT users.name, orders.total
+    FROM users LEFT JOIN orders ON orders.user_id = users.id;
+```
+
+The executor runs a **nested-loop join**, but when the `ON` clause is an
+equi-join against the inner table's primary key it upgrades to an **index
+nested-loop join** — a B+Tree seek per outer row instead of a full inner scan.
+`EXPLAIN` shows exactly that:
+
+```text
+EXPLAIN SELECT * FROM orders JOIN users ON orders.user_id = users.id;
+Nested Loop Join
+  -> Seq Scan on orders
+  -> INNER Join  Index Seek on users_pkey (users.id = orders.user_id) [per outer row]
+```
 
 ## Benchmarks
 
@@ -218,14 +250,15 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 39 tests across every layer
+pytest                    # 52 tests across every layer
 ruff check .              # lint
 ```
 
 The suite covers the B+Tree (including multi-level splits and reopen), the
 tokenizer/parser, end-to-end SQL and constraints, the planner's access-path
-choices, transaction rollback, durability across reopen, MVCC visibility, and
-both crash-recovery directions. CI runs it on Linux and Windows across Python
+choices, `INNER` / `LEFT` / multi-table joins and ambiguity handling,
+transaction rollback, durability across reopen, MVCC visibility, and both
+crash-recovery directions. CI runs it on Linux and Windows across Python
 3.10–3.12.
 
 ## Project layout
@@ -237,7 +270,7 @@ minidb/
   engine/    catalog.py  types.py  planner.py  executor.py
   txn/       mvcc.py
   database.py  repl.py  __main__.py
-tests/       test_btree.py  test_parser.py  test_sql.py  test_transactions.py
+tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py  test_transactions.py
 benchmarks/  bench.py
 examples/    demo.py  tour.sql
 docs/        ARCHITECTURE.md
@@ -249,7 +282,8 @@ Deliberately out of scope for v0.1, and each a fun next step:
 
 - [ ] Secondary indexes (right now the primary key is the only index)
 - [ ] Multi-writer concurrency with lock/latch management
-- [ ] Joins and aggregation (`GROUP BY`, `COUNT`, `SUM`)
+- [ ] Aggregation (`GROUP BY`, `COUNT`, `SUM`) and `RIGHT` / `FULL` joins
+- [ ] A hash-join strategy for non-PK equi-joins
 - [ ] B+Tree node merging on delete (leaves currently only split)
 - [ ] Overflow pages for values larger than one page
 - [ ] A cost-based planner using table statistics
