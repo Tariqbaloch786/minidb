@@ -8,7 +8,7 @@ driver (like `sqlite3`), or as a **networked server** many clients share.
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-79%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-90%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
@@ -79,7 +79,7 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 |-------|------|----------------|
 | Pager | [`storage/pager.py`](minidb/storage/pager.py) | Fixed-size page I/O, allocation, free list, dirty-page buffering |
 | WAL | [`storage/wal.py`](minidb/storage/wal.py) | Redo logging, `fsync` on commit, crash recovery, CRC-checked records |
-| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered `int → bytes` index; point, range and full scans; node splits |
+| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered `int → bytes` index; point, range and full scans; node splits, delete rebalancing (merge/redistribute/root-collapse), and a `validate()` invariant |
 | Tokenizer/Parser | [`sql/`](minidb/sql/) | Hand-written lexer + recursive-descent parser → typed AST |
 | Catalog | [`engine/catalog.py`](minidb/engine/catalog.py) | Table schemas, persisted inside the DB file |
 | Planner | [`engine/planner.py`](minidb/engine/planner.py) | Turns `WHERE` into an index seek / range scan / seq scan + residual filter |
@@ -340,7 +340,7 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 79 tests across every layer
+pytest                    # 90 tests across every layer
 ruff check .              # lint
 ```
 
@@ -376,7 +376,8 @@ Deliberately out of scope for v0.1, and each a fun next step:
 - [ ] Multi-writer concurrency with row/page-level locking (today: serialized writes)
 - [ ] `RIGHT` / `FULL` joins and a hash-join strategy for non-PK equi-joins
 - [ ] More SQL surface: `DISTINCT`, `LIKE`, subqueries, `ALTER TABLE`
-- [ ] B+Tree node merging on delete (leaves currently only split)
+- [x] B+Tree delete rebalancing (merge / redistribute / root-collapse) with a `validate()` invariant and randomized fuzz tests
+- [ ] Page checksums + corruption detection; a bounded buffer pool with eviction
 - [ ] Overflow pages for values larger than one page
 - [ ] A cost-based planner using table statistics
 

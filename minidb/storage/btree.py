@@ -75,6 +75,9 @@ class _Internal:
         self.keys: list[int] = keys or []
         self.children: list[int] = children or []
 
+    def nbytes(self) -> int:
+        return _INT_HEADER + 8 * len(self.keys) + 4 * len(self.children)
+
     def serialize(self) -> bytes:
         out = bytearray()
         out += struct.pack("<BH", _INTERNAL, len(self.keys))
@@ -212,25 +215,135 @@ class BPlusTree:
         return (sep_key, right_id)
 
     # -- delete ------------------------------------------------------------
-    # A tombstone-free structural delete. To keep the implementation focused we
-    # do not merge underflowing nodes (leaves may become sparse); correctness
-    # and ordered iteration are preserved. Rows are usually removed logically by
-    # the MVCC layer instead, so physical deletes are rare.
+    # A full structural delete: underflowing nodes borrow from a sibling
+    # (redistribution) or merge with one, freeing the emptied page, and the root
+    # collapses when it is reduced to a single child. The B+Tree invariants
+    # (see ``validate``) hold after any sequence of inserts and deletes.
+    #
+    # Underflow is measured by *byte* fill, because values are variable length:
+    # a node below half a page is a candidate to be re-balanced. The lone root is
+    # never considered underfull (a tree may legitimately be nearly empty).
     def delete(self, key: int) -> bool:
-        return self._delete(self.root, key)
+        found, _ = self._delete(self.root, key, is_root=True)
+        root = self._load(self.root)
+        if isinstance(root, _Internal) and len(root.keys) == 0:
+            # root has a single child: collapse a level, freeing the old root
+            only_child = root.children[0]
+            self.pager.free_page(self.root)
+            self.root = only_child
+        return found
 
-    def _delete(self, page_id: int, key: int) -> bool:
+    def _delete(self, page_id: int, key: int, is_root: bool = False):
+        """Delete ``key`` from the subtree at ``page_id``.
+
+        Returns ``(found, underfull)`` where ``underfull`` tells the caller the
+        child dropped below the minimum fill and must be re-balanced.
+        """
         node = self._load(page_id)
         if isinstance(node, _Leaf):
+            found = False
             for i, k in enumerate(node.keys):
                 if k == key:
                     del node.keys[i]
                     del node.vals[i]
-                    self._store(page_id, node)
-                    return True
-            return False
+                    found = True
+                    break
+            self._store(page_id, node)
+            return found, self._leaf_underfull(node, is_root)
+
         idx = self._child_index(node, key)
-        return self._delete(node.children[idx], key)
+        found, child_underfull = self._delete(node.children[idx], key)
+        if child_underfull:
+            self._rebalance(node, idx)
+        self._store(page_id, node)
+        return found, self._internal_underfull(node, is_root)
+
+    @staticmethod
+    def _leaf_underfull(node: _Leaf, is_root: bool) -> bool:
+        return (not is_root) and node.nbytes() < PAGE_SIZE // 2
+
+    @staticmethod
+    def _internal_underfull(node: _Internal, is_root: bool) -> bool:
+        return (not is_root) and len(node.keys) < max(1, _MAX_INT_KEYS // 2)
+
+    def _rebalance(self, parent: _Internal, idx: int) -> None:
+        """Fix ``parent.children[idx]`` after it underflowed: merge with a
+        sibling if their contents fit one page, otherwise redistribute."""
+        child = self._load(parent.children[idx])
+        left = self._load(parent.children[idx - 1]) if idx > 0 else None
+        right = (self._load(parent.children[idx + 1])
+                 if idx + 1 < len(parent.children) else None)
+
+        # Prefer merging (it reclaims a page) when the result fits in one page.
+        if right is not None and self._merge_fits(child, right):
+            self._merge(parent, idx, child, right, parent.children[idx + 1])
+        elif left is not None and self._merge_fits(left, child):
+            self._merge(parent, idx - 1, left, child, parent.children[idx])
+        elif right is not None and (left is None or right.nbytes() >= left.nbytes()):
+            self._borrow_right(parent, idx, child, right, parent.children[idx + 1])
+        elif left is not None:
+            self._borrow_left(parent, idx, child, left, parent.children[idx - 1])
+        # else: child is the only child of the root — root collapse handles it.
+
+    @staticmethod
+    def _merge_fits(left, right) -> bool:
+        if isinstance(left, _Leaf):
+            return left.nbytes() + right.nbytes() - _LEAF_HEADER <= PAGE_SIZE
+        total_keys = len(left.keys) + 1 + len(right.keys)  # +1 pulled-down separator
+        return _INT_HEADER + 8 * total_keys + 4 * (total_keys + 1) <= PAGE_SIZE
+
+    def _merge(self, parent: _Internal, sep: int, left, right, right_id: int) -> None:
+        """Merge the two children on either side of ``parent.keys[sep]`` into the
+        left node, free the right page, and drop the separator."""
+        left_id = parent.children[sep]
+        if isinstance(left, _Leaf):
+            left.keys += right.keys
+            left.vals += right.vals
+            left.next_leaf = right.next_leaf
+        else:
+            left.keys.append(parent.keys[sep])  # pull the separator down
+            left.keys += right.keys
+            left.children += right.children
+        self._store(left_id, left)
+        self.pager.free_page(right_id)
+        del parent.keys[sep]
+        del parent.children[sep + 1]
+
+    def _borrow_right(self, parent, idx, child, right, right_id) -> None:
+        """Move entries from the right sibling into ``child`` until it is filled
+        past the underflow line, fixing the separator ``parent.keys[idx]``."""
+        child_id = parent.children[idx]
+        if isinstance(child, _Leaf):
+            while (child.nbytes() < PAGE_SIZE // 2 and len(right.keys) > 1
+                   and child.nbytes() + 12 + len(right.vals[0]) <= PAGE_SIZE):
+                child.keys.append(right.keys.pop(0))
+                child.vals.append(right.vals.pop(0))
+            parent.keys[idx] = right.keys[0]
+        else:
+            while len(child.keys) < max(1, _MAX_INT_KEYS // 2) and len(right.keys) > 1:
+                child.keys.append(parent.keys[idx])
+                child.children.append(right.children.pop(0))
+                parent.keys[idx] = right.keys.pop(0)
+        self._store(child_id, child)
+        self._store(right_id, right)
+
+    def _borrow_left(self, parent, idx, child, left, left_id) -> None:
+        """Symmetric to :meth:`_borrow_right`, pulling from the left sibling and
+        fixing the separator ``parent.keys[idx - 1]``."""
+        child_id = parent.children[idx]
+        if isinstance(child, _Leaf):
+            while (child.nbytes() < PAGE_SIZE // 2 and len(left.keys) > 1
+                   and child.nbytes() + 12 + len(left.vals[-1]) <= PAGE_SIZE):
+                child.keys.insert(0, left.keys.pop())
+                child.vals.insert(0, left.vals.pop())
+            parent.keys[idx - 1] = child.keys[0]
+        else:
+            while len(child.keys) < max(1, _MAX_INT_KEYS // 2) and len(left.keys) > 1:
+                child.keys.insert(0, parent.keys[idx - 1])
+                child.children.insert(0, left.children.pop())
+                parent.keys[idx - 1] = left.keys.pop()
+        self._store(child_id, child)
+        self._store(left_id, left)
 
     # -- ordered iteration -------------------------------------------------
     def _leftmost_leaf(self) -> int:
@@ -265,3 +378,61 @@ class BPlusTree:
                     return
                 yield k, v
             page_id = leaf.next_leaf
+
+    # -- integrity check ---------------------------------------------------
+    def validate(self) -> bool:
+        """Assert every B+Tree structural invariant; return True if well-formed.
+
+        Invariants checked:
+
+        * keys are strictly sorted within every node and lie inside the
+          ``[low, high)`` range implied by their ancestors' separators;
+        * every internal node has exactly ``len(keys) + 1`` children and at
+          least one separator;
+        * all leaves are at the same depth (the tree is height-balanced);
+        * the left-to-right ``next_leaf`` chain visits exactly the leaves found
+          by an in-order descent, in the same order, with no cycle;
+        * concatenating the leaves yields a globally sorted key sequence.
+
+        Raises :class:`AssertionError` (with a description) on any violation.
+        """
+        leaves_in_order: list[int] = []
+
+        def check(page_id: int, lo, hi, depth: int) -> int:
+            node = self._load(page_id)
+            if isinstance(node, _Leaf):
+                for i, k in enumerate(node.keys):
+                    assert lo is None or k >= lo, f"leaf key {k} < lower bound {lo}"
+                    assert hi is None or k < hi, f"leaf key {k} >= upper bound {hi}"
+                    assert i == 0 or node.keys[i - 1] < k, "leaf keys not sorted"
+                leaves_in_order.append(page_id)
+                return depth
+            assert len(node.children) == len(node.keys) + 1, \
+                f"internal node {page_id}: children != keys + 1"
+            assert len(node.keys) >= 1, f"internal node {page_id} has no separators"
+            for i in range(1, len(node.keys)):
+                assert node.keys[i - 1] < node.keys[i], "separators not sorted"
+            depths = set()
+            for i, cid in enumerate(node.children):
+                clo = lo if i == 0 else node.keys[i - 1]
+                chi = hi if i == len(node.children) - 1 else node.keys[i]
+                depths.add(check(cid, clo, chi, depth + 1))
+            assert len(depths) == 1, f"tree unbalanced: differing leaf depths {depths}"
+            return depths.pop()
+
+        check(self.root, None, None, 0)
+
+        # The sibling chain must agree with the in-order leaf sequence.
+        chain: list[int] = []
+        all_keys: list[int] = []
+        page_id = self._leftmost_leaf()
+        limit = len(leaves_in_order) + 1
+        while page_id != NO_PAGE:
+            assert len(chain) < limit, "cycle detected in leaf next_leaf chain"
+            leaf = self._load(page_id)
+            chain.append(page_id)
+            all_keys.extend(leaf.keys)
+            page_id = leaf.next_leaf
+        assert chain == leaves_in_order, "leaf chain disagrees with tree order"
+        assert all_keys == sorted(all_keys), "global key order violated"
+        return True
