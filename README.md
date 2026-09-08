@@ -8,15 +8,15 @@ driver (like `sqlite3`), or as a **networked server** many clients share.
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-108%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-129%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
-storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, a
-hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
+storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, **per-page checksums**, a bounded
+**buffer pool**, a hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
 an index-nested-loop strategy, **secondary indexes** (`CREATE INDEX`),
 **aggregation** (`GROUP BY` / `HAVING`), **parameterized queries**, and **MVCC
-transactions** — in ~3,700 lines of dependency-free, tested Python. On top of the
+transactions** — in ~4,000 lines of dependency-free, tested Python. On top of the
 engine sit a **DB-API 2.0 driver** and a **client/server** so applications can
 actually use it.
 
@@ -78,7 +78,8 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 
 | Layer | File | Responsibility |
 |-------|------|----------------|
-| Pager | [`storage/pager.py`](minidb/storage/pager.py) | Fixed-size page I/O, allocation, free list, dirty-page buffering |
+| Pager | [`storage/pager.py`](minidb/storage/pager.py) | Checksummed physical page I/O (CRC + page-id per page), allocation, free list; raises `CorruptionError` |
+| Buffer pool | [`storage/buffer_pool.py`](minidb/storage/buffer_pool.py) | Bounded LRU cache, pin/unpin, dirty tracking, hit/miss stats, no-steal buffering |
 | WAL | [`storage/wal.py`](minidb/storage/wal.py) | Redo logging, `fsync` on commit, crash recovery, CRC-checked records |
 | B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered index over `int` **or** `bytes` keys; point/range/full scans; splits, delete rebalancing (merge/redistribute/root-collapse), `validate()` |
 | Indexes | [`engine/index.py`](minidb/engine/index.py) | Secondary indexes: order-preserving key encoding, unique/non-unique, maintenance |
@@ -336,10 +337,16 @@ than the sequential scan the planner falls back to when it can't use the key.
 
 minidb uses a **WAL-first, force-at-commit** policy:
 
-1. A transaction's page changes stay in an in-memory buffer.
+1. A transaction's page changes stay in the **buffer pool** (dirty, resident).
 2. On `COMMIT`, every modified page's after-image is appended to the WAL, a
    `COMMIT` record is written and **`fsync`'d**, and only then are the pages
    flushed to the main file and the WAL checkpointed.
+
+The buffer pool is deliberately **no-steal**: it never writes a dirty
+(uncommitted) page to disk, so the WAL is always durable *before* those changes
+reach the main file, and `ROLLBACK` is just "drop the dirty frames." It evicts
+only clean pages (LRU); if a single transaction's dirty working set exceeds the
+pool it stays resident (the pool grows) rather than risk data loss.
 
 That gives two guarantees, both directly tested:
 
@@ -350,6 +357,34 @@ That gives two guarantees, both directly tested:
 
 See [`test_transactions.py`](tests/test_transactions.py) — the recovery tests
 literally build a torn-write scenario and reopen the database.
+
+## Storage reliability: checksums & the buffer pool
+
+Every physical page carries an 8-byte header — a **CRC32 over the page's id and
+data**. On every read the pager recomputes the CRC and checks the stored page
+id, so a bit-flip, a torn/truncated page, or a misdirected read becomes a
+deterministic **`CorruptionError`** instead of silently wrong data. The meta
+page is protected the same way.
+
+- **What it protects:** single-byte flips anywhere in a page, a page written to
+  the wrong offset, and truncated/short final pages.
+- **What it does *not*:** it's an integrity check (CRC32), **not** a
+  cryptographic MAC — it won't stop a deliberate attacker who also rewrites the
+  checksum; and it doesn't *repair* corruption. WAL redo can heal a damaged page
+  if a committed after-image for it is still in the log; otherwise the engine
+  refuses to serve it. Logical (semantically-wrong-but-valid) corruption is the
+  B+Tree `validate()`'s job, not the checksum's.
+
+Reads and writes go through a **bounded buffer pool** (LRU, configurable via
+`Database(path, cache_pages=…)`) that caches pages across transactions, tracks
+hits/misses/evictions (`db.cache_stats()`), and supports pin/unpin. See
+[`test_pager_checksum.py`](tests/test_pager_checksum.py),
+[`test_buffer_pool.py`](tests/test_buffer_pool.py), and
+[`test_storage_stress.py`](tests/test_storage_stress.py).
+
+> **Format note:** adding checksums changed the on-disk page format; the file
+> magic is now `MDB2`. Databases written by earlier (`MDB1`) versions are not
+> readable — this is a young project and the break is intentional and explicit.
 
 ## MVCC in one paragraph
 
@@ -367,30 +402,35 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 108 tests across every layer
+pytest                    # 129 tests across every layer
 ruff check .              # lint
 ```
 
-The suite covers the B+Tree (including multi-level splits and reopen), the
-tokenizer/parser, end-to-end SQL and constraints, the planner's access-path
-choices, `INNER` / `LEFT` / multi-table joins, aggregation with `GROUP BY` /
-`HAVING`, parameter binding and injection safety, the DB-API 2.0 driver, the
-client/server (including the cross-connection transaction lock), transaction
-rollback, durability across reopen, MVCC visibility, and both crash-recovery
-directions. CI runs it on Linux and Windows across Python 3.10–3.12.
+The suite covers the B+Tree (including multi-level splits, delete rebalancing,
+and randomized fuzz), the tokenizer/parser, end-to-end SQL and constraints, the
+planner's access-path choices, secondary indexes, `INNER` / `LEFT` / multi-table
+joins, aggregation with `GROUP BY` / `HAVING`, parameter binding and injection
+safety, the DB-API 2.0 driver, the client/server (including the cross-connection
+transaction lock), **page checksums and corruption detection** (single-byte,
+per-region, truncation, bad headers, invalid page ids), the **buffer pool**
+(hits/misses, LRU eviction, pinning, dirty handling, WAL interaction), a
+**CRUD stress test under forced eviction**, transaction rollback, durability
+across reopen, MVCC visibility, and both crash-recovery directions. CI runs it
+on Linux and Windows across Python 3.10–3.12.
 
 ## Project layout
 
 ```text
 minidb/
-  storage/   pager.py  wal.py  btree.py
+  storage/   pager.py  buffer_pool.py  wal.py  btree.py
   sql/       tokenizer.py  ast.py  parser.py
   engine/    catalog.py  types.py  planner.py  executor.py  index.py
   txn/       mvcc.py
   database.py  dbapi.py  server.py  client.py  repl.py  __main__.py
 tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py
              test_aggregation.py  test_dbapi.py  test_server.py  test_transactions.py
-             test_btree_delete.py  test_indexes.py
+             test_btree_delete.py  test_indexes.py  test_pager_checksum.py
+             test_buffer_pool.py  test_storage_stress.py
 benchmarks/  bench.py
 examples/    demo.py  tour.sql
 docs/        ARCHITECTURE.md
@@ -405,7 +445,8 @@ Deliberately out of scope for v0.1, and each a fun next step:
 - [ ] `RIGHT` / `FULL` joins and a hash-join strategy for non-PK equi-joins
 - [ ] More SQL surface: `DISTINCT`, `LIKE`, subqueries, `ALTER TABLE`
 - [x] B+Tree delete rebalancing (merge / redistribute / root-collapse) with a `validate()` invariant and randomized fuzz tests
-- [ ] Page checksums + corruption detection; a bounded buffer pool with eviction
+- [x] Page checksums + deterministic corruption detection (`CorruptionError`)
+- [x] Bounded buffer pool (LRU eviction, pin/unpin, hit/miss stats, no-steal + WAL ordering)
 - [ ] `RIGHT` / `FULL` joins; a hash-join strategy
 - [ ] Overflow pages for values larger than one page
 - [ ] A cost-based planner using table statistics

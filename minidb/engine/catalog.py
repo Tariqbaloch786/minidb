@@ -12,10 +12,10 @@ import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..storage.pager import NO_PAGE, PAGE_SIZE, Pager
+from ..storage.pager import DATA_SIZE, NO_PAGE
 from .index import IndexSchema
 
-_CHUNK = PAGE_SIZE - 8  # 4 bytes next-page + 4 bytes chunk length
+_CHUNK = DATA_SIZE - 8  # 4 bytes next-page + 4 bytes chunk length
 
 
 @dataclass
@@ -41,8 +41,8 @@ class TableSchema:
 
 
 class Catalog:
-    def __init__(self, pager: Pager):
-        self.pager = pager
+    def __init__(self, pager):
+        self.pager = pager  # a Pager or BufferPool
         self.tables: dict[str, TableSchema] = {}
         self.indexes: dict[str, IndexSchema] = {}
         if pager.meta.catalog_root != NO_PAGE:
@@ -107,7 +107,7 @@ class Catalog:
         page_ids = [self.pager.allocate_page() for _ in chunks]
         for idx, (pid, chunk) in enumerate(zip(page_ids, chunks)):
             next_page = page_ids[idx + 1] if idx + 1 < len(page_ids) else NO_PAGE
-            page = bytearray(PAGE_SIZE)
+            page = bytearray(DATA_SIZE)
             struct.pack_into("<iI", page, 0, next_page, len(chunk))
             page[8 : 8 + len(chunk)] = chunk
             self.pager.write_page(pid, page)

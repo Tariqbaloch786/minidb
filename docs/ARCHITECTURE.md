@@ -6,21 +6,30 @@ the files in this order is the intended tour.
 
 ## 1. The file format (`storage/pager.py`)
 
-The entire database is one file split into fixed **4 KiB pages**. Page 0 is the
-**meta page**, a small header:
+The entire database is one file split into fixed **4 KiB physical pages**. Every
+physical page begins with an 8-byte header — a **CRC32** and the **page id** —
+followed by `DATA_SIZE` (4088) bytes of *data* that the layers above see:
 
 ```
-magic "MDB1" | page_size | num_pages | catalog_root | free_list_head | next_txid
+[ crc32 (u32) | page_id (u32) | data (4088 bytes) ]
 ```
 
-The `Pager` is the only thing that touches the file. It offers `read_page`,
-`write_page`, `allocate_page` (reusing freed pages via a free list), and — the
-important part — it **buffers writes**. Modified pages sit in memory in a dirty
-set until `flush()` writes them out and `fsync`s. That buffering is what lets a
-transaction stage many changes and commit (or discard) them atomically.
+Page 0's data is the **meta page**:
 
-Reads are cached too, but reads and writes are tracked separately so a
-read-only query never logs or flushes anything.
+```
+magic "MDB2" | page_size | num_pages | catalog_root | free_list_head | next_txid
+```
+
+The `Pager` is the only thing that touches the file, and it does **immediate,
+checksummed** physical I/O: `write_page` stamps the CRC (over `page_id || data`),
+and `read_page` recomputes it and checks the page id, raising **`CorruptionError`**
+on any mismatch, short read (truncation), or misdirected page. It does *no*
+caching or write-buffering itself — that is the buffer pool's job (§10). The
+`MDB1`→`MDB2` magic bump reflects the added header; older files are not readable.
+
+Checksums are an *integrity* check, not a MAC and not a repair mechanism: they
+turn silent corruption into a deterministic error. WAL redo (§2) can heal a
+damaged page when a committed after-image for it is still in the log.
 
 ## 2. Durability: the write-ahead log (`storage/wal.py`)
 
@@ -61,9 +70,12 @@ layout: the table *is* its primary-key index.
   fan-out), which keeps the code simple with variable-length values.
 
 Supported operations: `get` (point lookup), `range(lo, hi)`, `items()` (ordered
-full scan), `insert`/upsert, and `delete`. Leaves split on overflow; node
-merging on delete is left as future work (leaves may become sparse, which is
-correct, just not optimally compact).
+full scan), `insert`/upsert, and `delete`. Leaves split on overflow; **delete
+rebalances** (merge/redistribute with a sibling, root collapse) and frees empty
+pages. A `validate()` method asserts the structural invariants (key order,
+balance, sibling-chain consistency) and is exercised by randomized fuzz tests.
+The tree is **key-codec generic**: primary keys use fixed-width `int` keys and
+secondary indexes use variable-width `bytes` keys, over the same code.
 
 ## 4. SQL front-end (`sql/`)
 
@@ -141,9 +153,9 @@ pages, any version found on disk after a restart was necessarily written by a
 committed transaction — so an `xmin` we've never heard of is, by construction,
 committed. That's why minidb needs no persistent commit log.
 
-`ROLLBACK` is almost free: the transaction's page changes were only ever in the
-pager's buffer, so discarding them (and reloading the in-memory catalog) undoes
-everything.
+`ROLLBACK` is almost free: the transaction's page changes were only ever dirty
+frames in the buffer pool (never written to disk, by the no-steal policy — §10),
+so discarding them (and reloading the in-memory catalog) undoes everything.
 
 **Concurrency scope.** This build serializes writers (one active writer at a
 time). The version chains and visibility rules are the genuine article; a
@@ -209,3 +221,30 @@ embedded and DB-API paths assume a single process per file (like opening SQLite
 exclusively); for genuine multi-process/multi-client sharing, run the server.
 Writes are serialized everywhere. These are deliberate, documented trade-offs,
 not accidents.
+
+## 10. The buffer pool (`storage/buffer_pool.py`)
+
+Everything above storage talks to a **`BufferPool`**, not the pager directly:
+
+```
+engine → BufferPool → Pager → disk
+```
+
+The pool is a bounded LRU cache of page frames (`cache_pages`, default 1024). It
+serves `read_page` / `write_page` / `allocate_page` / `free_page`, tracks
+hits/misses/evictions (`db.cache_stats()`), and supports `pin`/`unpin`.
+
+**Durability — a no-steal policy.** The pool never writes a dirty page to disk
+on its own. Dirty pages hold the active transaction's uncommitted changes and
+stay resident until commit, when `Database._commit` logs their after-images to
+the WAL, fsyncs the commit record, and *only then* calls `pool.flush()` (which
+writes them via the pager and fsyncs). This is exactly the WAL rule — **the log
+is durable before the page reaches the main file** — and it is why `ROLLBACK` is
+just `pool.discard()` (drop the dirty frames; reload meta from disk).
+
+**Eviction** therefore only ever targets **clean, unpinned** frames (dropping
+them is safe — they equal what's on disk). If every resident frame is dirty or
+pinned, the pool grows past `capacity` rather than lose data or deadlock, so a
+single transaction's dirty working set must fit in memory. Making dirty pages
+stealable would require UNDO logging, which this build does not have — a
+deliberate, documented limitation (no concurrent writers yet either).

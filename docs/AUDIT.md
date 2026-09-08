@@ -42,14 +42,12 @@ Facade: database.py (execute + txn lifecycle) · dbapi.py (PEP 249) · server.py
 ## 2. Critical weaknesses (grounded in the code)
 
 ### Storage / durability
-- **No page checksums.** `pager._read_raw` silently zero-pads short reads and
-  never verifies integrity. A torn write or bit-rot on any non-meta page is read
-  as valid → wrong results or a `struct` crash. *(Highest-value storage gap.)*
-- **The meta page (page 0) is unprotected.** A torn meta write can only be
-  repaired via WAL replay, and only while the WAL still holds that page image.
-- **No real buffer pool.** `pager._cache` is unbounded and is *cleared on every
-  flush*, so there is no cross-transaction caching, no eviction policy, and no
-  hit/miss accounting. Large databases will thrash.
+- ~~No page checksums.~~ **Done:** every page carries a CRC + page-id, verified
+  on read; corruption raises `CorruptionError`. The meta page is protected too.
+- ~~The meta page is unprotected.~~ **Done:** page 0 is checksummed like any page.
+- ~~No real buffer pool.~~ **Done:** a bounded LRU pool caches across
+  transactions, evicts clean pages, tracks hits/misses/evictions, and keeps the
+  no-steal WAL ordering. (Limit: a single txn's dirty set must fit in memory.)
 
 ### B+Tree
 - **Delete never rebalances** (`btree.py:214`): it removes the key from a leaf
@@ -139,10 +137,10 @@ format changes bump the file magic (`MDB1` → `MDB2`) and are documented.
 **Tier 1 — Foundation (correctness of storage & access)**
 1. ✅ Audit + this document.
 2. ✅ **B+Tree delete: merge / redistribute / root-collapse + `validate()` + fuzz.**
-3. Page checksums + corruption detection (`CorruptionError`); protect meta. *(format bump)* ← *next*
-4. Real buffer pool: bounded cache, pin/unpin, CLOCK/LRU eviction, hit/miss stats.
+3. ✅ **Page checksums + corruption detection** (`CorruptionError`); meta protected. *(format bump MDB1→MDB2)*
+4. ✅ **Bounded buffer pool:** LRU eviction, pin/unpin, hit/miss stats, no-steal buffering preserving WAL ordering.
 5. ✅ **Secondary indexes:** `CREATE/DROP INDEX`, catalog metadata, order-preserving key encoding, maintenance on DML, planner selection, equality + range scans, unique/non-unique/composite.
-6. Overflow pages for large values.
+6. Overflow pages for large values. ← *next*
 7. WAL/recovery hardening: LSNs, checkpoint records, expanded crash-injection tests.
 
 **Tier 2 — Database correctness**

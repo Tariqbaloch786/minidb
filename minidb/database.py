@@ -24,13 +24,14 @@ from .engine.catalog import Catalog
 from .engine.executor import Executor, Result
 from .sql import ast
 from .sql.parser import bind_parameters, parse
+from .storage.buffer_pool import DEFAULT_CAPACITY, BufferPool
 from .storage.pager import Pager
 from .storage.wal import WAL
 from .txn.mvcc import Transaction, TransactionManager
 
 
 class Database:
-    def __init__(self, path: str = ":memory:"):
+    def __init__(self, path: str = ":memory:", cache_pages: int = DEFAULT_CAPACITY):
         self.path = path
         self._memory = path == ":memory:"
         if self._memory:
@@ -41,16 +42,22 @@ class Database:
             self._tmpdir = tempfile.mkdtemp(prefix="minidb-mem-")
             path = os.path.join(self._tmpdir, "db")
 
-        self.pager = Pager(path)
+        self._pager = Pager(path)  # checksummed physical layer
         self.wal = WAL(path + ".wal")
-        # Crash recovery: replay committed transactions, then checkpoint.
-        self.wal.recover(self.pager)
+        # Crash recovery: replay committed transactions onto the file, checkpoint.
+        self.wal.recover(self._pager)
         self.wal.truncate()
 
+        # The buffer pool is the storage interface everything above uses.
+        self.pager = BufferPool(self._pager, capacity=cache_pages)
         self.catalog = Catalog(self.pager)
         self.txn_manager = TransactionManager(self.pager)
         self.executor = Executor(self)
         self.current_txn: Optional[Transaction] = None
+
+    def cache_stats(self) -> dict:
+        """Buffer-pool diagnostics (hits, misses, evictions, residency, …)."""
+        return self.pager.stats()
 
     # -- public API --------------------------------------------------------
     def execute(self, sql: str, params: tuple = ()) -> Result:

@@ -130,9 +130,11 @@ class WAL:
 
         for txid, page_id, data in page_writes:
             if txid in committed:
-                pager.apply_raw(page_id, data)
-        pager._f.flush()
-        os.fsync(pager._f.fileno())
+                pager.write_page(page_id, data)  # re-stamps a valid checksum
+        pager.sync()
+        # refresh in-memory meta from the (possibly rewritten) page 0
+        from .pager import Meta
+        pager.meta = Meta.unpack(pager.read_page(0))
         return sorted(committed)
 
     def truncate(self) -> None:

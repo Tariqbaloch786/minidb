@@ -50,8 +50,8 @@ def _crash_after_commit_record(db, sql):
     for pid, data in db.pager.dirty_pages().items():
         db.wal.log_page(txn.xid, pid, data)
     db.wal.log_commit(txn.xid)
-    db.wal._f.flush()
-    db.pager._f.flush()
+    # NOTE: deliberately do NOT call db.pager.flush() — the pages stay buffered
+    # (no-steal), so the main file is missing this txn and recovery must redo it.
 
 
 def test_recovery_redoes_committed_txn(tmp_path):

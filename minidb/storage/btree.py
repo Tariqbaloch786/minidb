@@ -26,7 +26,10 @@ from __future__ import annotations
 import struct
 from typing import Iterator, Optional
 
-from .pager import NO_PAGE, PAGE_SIZE, Pager
+# The B+Tree works in terms of the pager's *data area* size (a physical page
+# minus the pager's checksum header); alias it as PAGE_SIZE for the byte budgets.
+from .pager import DATA_SIZE as PAGE_SIZE
+from .pager import NO_PAGE
 
 _LEAF = 1
 _INTERNAL = 0
@@ -151,14 +154,14 @@ _MAX_INT_KEYS = (PAGE_SIZE - _INT_HEADER - 4) // 12
 
 
 class BPlusTree:
-    def __init__(self, pager: Pager, root_page_id: int, codec=INT_CODEC):
-        self.pager = pager
+    def __init__(self, pager, root_page_id: int, codec=INT_CODEC):
+        self.pager = pager  # a Pager or BufferPool: read_page/write_page/alloc/free
         self.root = root_page_id
         self.codec = codec
 
     # -- construction ------------------------------------------------------
     @classmethod
-    def create(cls, pager: Pager, codec=INT_CODEC) -> "BPlusTree":
+    def create(cls, pager, codec=INT_CODEC) -> "BPlusTree":
         root = pager.allocate_page()
         pager.write_page(root, _Leaf().serialize(codec))
         return cls(pager, root, codec)
