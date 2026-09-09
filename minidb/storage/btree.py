@@ -9,8 +9,9 @@ Design notes
 * Values are variable-length byte strings (a serialized row / version chain).
 * Nodes split by *byte budget* rather than a fixed fan-out, which keeps the
   code simple while supporting variable-length values.
-* A single value must fit within one page; larger blobs would need overflow
-  pages (a deliberate, documented limitation).
+* A value larger than half a page is spilled to a chain of **overflow pages**;
+  the leaf stores a small pointer (head page + length) in its place, so values
+  from a few bytes to many megabytes are all supported.
 
 Leaf page layout (little-endian)::
 
@@ -74,23 +75,54 @@ INT_CODEC = _IntCodec()
 BYTES_CODEC = _BytesCodec()
 
 
+# A value too big to sit inside a leaf is spilled to a chain of *overflow*
+# pages; the leaf stores a small pointer to it instead. In a serialized leaf
+# entry, the high bit of the 4-byte value-length field flags an overflow
+# pointer (payload = head page id + total length, 12 bytes). Old files never set
+# this bit, so the format stays backward compatible.
+_OVERFLOW_FLAG = 0x80000000
+_OVERFLOW_PTR = struct.Struct("<iI")  # head_page_id, total_length
+_OVERFLOW_PTR_SIZE = _OVERFLOW_PTR.size  # 8 bytes
+_OVERFLOW_HEADER = 8  # next_page(i) + chunk_len(I) at the start of each overflow page
+
+
+class _Overflow:
+    """In-memory marker for a value that lives in an overflow chain."""
+
+    __slots__ = ("head", "length")
+
+    def __init__(self, head: int, length: int):
+        self.head = head
+        self.length = length
+
+
+def _vsize(v) -> int:
+    """Bytes an entry's value contributes to a leaf (a fixed ptr if overflown)."""
+    return _OVERFLOW_PTR_SIZE if isinstance(v, _Overflow) else len(v)
+
+
 class _Leaf:
     __slots__ = ("keys", "vals", "next_leaf")
 
     def __init__(self, keys=None, vals=None, next_leaf=NO_PAGE):
         self.keys: list = keys or []
-        self.vals: list[bytes] = vals or []
+        self.vals: list = vals or []  # each is bytes (inline) or _Overflow
         self.next_leaf = next_leaf
 
     def nbytes(self, codec) -> int:
-        return _LEAF_HEADER + sum(codec.size(k) + 4 + len(v)
+        return _LEAF_HEADER + sum(codec.size(k) + 4 + _vsize(v)
                                   for k, v in zip(self.keys, self.vals))
 
     def serialize(self, codec) -> bytes:
         out = bytearray()
         out += struct.pack("<BiH", _LEAF, self.next_leaf, len(self.keys))
         for k, v in zip(self.keys, self.vals):
-            out += codec.pack(k) + struct.pack("<I", len(v)) + v
+            out += codec.pack(k)
+            if isinstance(v, _Overflow):
+                out += struct.pack("<I", _OVERFLOW_FLAG | _OVERFLOW_PTR_SIZE)
+                out += _OVERFLOW_PTR.pack(v.head, v.length)
+            else:
+                out += struct.pack("<I", len(v)) + v
         if len(out) > PAGE_SIZE:
             raise ValueError("leaf overflow")
         return bytes(out) + b"\x00" * (PAGE_SIZE - len(out))
@@ -103,10 +135,16 @@ class _Leaf:
         for _ in range(num):
             k, ksz = codec.unpack(data, pos)
             pos += ksz
-            (vlen,) = struct.unpack_from("<I", data, pos)
+            (raw,) = struct.unpack_from("<I", data, pos)
             pos += 4
-            vals.append(bytes(data[pos : pos + vlen]))
-            pos += vlen
+            length = raw & ~_OVERFLOW_FLAG
+            payload = data[pos : pos + length]
+            pos += length
+            if raw & _OVERFLOW_FLAG:
+                head, total = _OVERFLOW_PTR.unpack(payload)
+                vals.append(_Overflow(head, total))
+            else:
+                vals.append(bytes(payload))
             keys.append(k)
         return cls(keys, vals, next_leaf)
 
@@ -152,6 +190,10 @@ def _is_leaf(data: bytes) -> bool:
 # max internal fan-out that always fits in a page (fixed 8-byte int keys)
 _MAX_INT_KEYS = (PAGE_SIZE - _INT_HEADER - 4) // 12
 
+# values larger than this are spilled to an overflow chain (keeps leaves dense
+# and guarantees an inline value always fits in a page alongside its neighbours)
+_INLINE_MAX = PAGE_SIZE // 2
+
 
 class BPlusTree:
     def __init__(self, pager, root_page_id: int, codec=INT_CODEC):
@@ -175,6 +217,39 @@ class BPlusTree:
     def _store(self, page_id: int, node) -> None:
         self.pager.write_page(page_id, node.serialize(self.codec))
 
+    # -- overflow chains ---------------------------------------------------
+    def _write_overflow(self, value: bytes) -> _Overflow:
+        cap = PAGE_SIZE - _OVERFLOW_HEADER
+        chunks = [value[i : i + cap] for i in range(0, len(value), cap)] or [b""]
+        page_ids = [self.pager.allocate_page() for _ in chunks]
+        for i, (pid, chunk) in enumerate(zip(page_ids, chunks)):
+            nxt = page_ids[i + 1] if i + 1 < len(page_ids) else NO_PAGE
+            buf = bytearray(PAGE_SIZE)
+            struct.pack_into("<iI", buf, 0, nxt, len(chunk))
+            buf[_OVERFLOW_HEADER : _OVERFLOW_HEADER + len(chunk)] = chunk
+            self.pager.write_page(pid, buf)
+        return _Overflow(page_ids[0], len(value))
+
+    def _read_overflow(self, ov: _Overflow) -> bytes:
+        out = bytearray()
+        pid = ov.head
+        while pid != NO_PAGE and len(out) < ov.length:
+            page = bytes(self.pager.read_page(pid))
+            nxt, clen = struct.unpack_from("<iI", page, 0)
+            out += page[_OVERFLOW_HEADER : _OVERFLOW_HEADER + clen]
+            pid = nxt
+        return bytes(out[: ov.length])
+
+    def _free_overflow(self, ov: _Overflow) -> None:
+        pid = ov.head
+        while pid != NO_PAGE:
+            (nxt,) = struct.unpack_from("<i", bytes(self.pager.read_page(pid)), 0)
+            self.pager.free_page(pid)
+            pid = nxt
+
+    def _materialize(self, v):
+        return self._read_overflow(v) if isinstance(v, _Overflow) else v
+
     # -- point lookup ------------------------------------------------------
     def get(self, key: int) -> Optional[bytes]:
         page_id = self.root
@@ -184,7 +259,7 @@ class BPlusTree:
             node = self._load(page_id)
         for k, v in zip(node.keys, node.vals):
             if k == key:
-                return v
+                return self._materialize(v)
         return None
 
     @staticmethod
@@ -196,7 +271,8 @@ class BPlusTree:
 
     # -- insert / upsert ---------------------------------------------------
     def insert(self, key: int, value: bytes) -> None:
-        split = self._insert(self.root, key, value)
+        stored = self._write_overflow(value) if len(value) > _INLINE_MAX else value
+        split = self._insert(self.root, key, stored)
         if split is not None:
             sep_key, right_id = split
             new_root = _Internal(keys=[sep_key], children=[self.root, right_id])
@@ -231,8 +307,7 @@ class BPlusTree:
             return len(node.keys) > _MAX_INT_KEYS
         return node.nbytes(self.codec) > PAGE_SIZE
 
-    @staticmethod
-    def _leaf_upsert(node: _Leaf, key: int, value: bytes) -> None:
+    def _leaf_upsert(self, node: _Leaf, key: int, value) -> None:
         lo, hi = 0, len(node.keys)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -241,6 +316,8 @@ class BPlusTree:
             else:
                 hi = mid
         if lo < len(node.keys) and node.keys[lo] == key:
+            if isinstance(node.vals[lo], _Overflow):
+                self._free_overflow(node.vals[lo])  # replacing: reclaim old chain
             node.vals[lo] = value
         else:
             node.keys.insert(lo, key)
@@ -298,6 +375,8 @@ class BPlusTree:
             found = False
             for i, k in enumerate(node.keys):
                 if k == key:
+                    if isinstance(node.vals[i], _Overflow):
+                        self._free_overflow(node.vals[i])  # reclaim the chain
                     del node.keys[i]
                     del node.vals[i]
                     found = True
@@ -376,7 +455,7 @@ class BPlusTree:
         if isinstance(child, _Leaf):
             while (child.nbytes(self.codec) < PAGE_SIZE // 2 and len(right.keys) > 1
                    and child.nbytes(self.codec)
-                   + self.codec.size(right.keys[0]) + 4 + len(right.vals[0]) <= PAGE_SIZE):
+                   + self.codec.size(right.keys[0]) + 4 + _vsize(right.vals[0]) <= PAGE_SIZE):
                 child.keys.append(right.keys.pop(0))
                 child.vals.append(right.vals.pop(0))
             parent.keys[idx] = right.keys[0]
@@ -395,7 +474,7 @@ class BPlusTree:
         if isinstance(child, _Leaf):
             while (child.nbytes(self.codec) < PAGE_SIZE // 2 and len(left.keys) > 1
                    and child.nbytes(self.codec)
-                   + self.codec.size(left.keys[-1]) + 4 + len(left.vals[-1]) <= PAGE_SIZE):
+                   + self.codec.size(left.keys[-1]) + 4 + _vsize(left.vals[-1]) <= PAGE_SIZE):
                 child.keys.insert(0, left.keys.pop())
                 child.vals.insert(0, left.vals.pop())
             parent.keys[idx - 1] = child.keys[0]
@@ -421,7 +500,7 @@ class BPlusTree:
         while page_id != NO_PAGE:
             leaf = self._load(page_id)
             for k, v in zip(leaf.keys, leaf.vals):
-                yield k, v
+                yield k, self._materialize(v)
             page_id = leaf.next_leaf
 
     def range(self, lo: Optional[int], hi: Optional[int]) -> Iterator[tuple[int, bytes]]:
@@ -438,7 +517,7 @@ class BPlusTree:
                     continue
                 if hi is not None and k > hi:
                     return
-                yield k, v
+                yield k, self._materialize(v)
             page_id = leaf.next_leaf
 
     # -- integrity check ---------------------------------------------------
@@ -509,4 +588,8 @@ class BPlusTree:
             node = self._load(page_id)
             if isinstance(node, _Internal):
                 stack.extend(node.children)
+            else:
+                for v in node.vals:  # reclaim any overflow chains too
+                    if isinstance(v, _Overflow):
+                        self._free_overflow(v)
             self.pager.free_page(page_id)

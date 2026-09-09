@@ -72,7 +72,15 @@ layout: the table *is* its primary-key index.
 Supported operations: `get` (point lookup), `range(lo, hi)`, `items()` (ordered
 full scan), `insert`/upsert, and `delete`. Leaves split on overflow; **delete
 rebalances** (merge/redistribute with a sibling, root collapse) and frees empty
-pages. A `validate()` method asserts the structural invariants (key order,
+pages.
+
+**Large values (overflow pages).** A value bigger than half a page is written to
+a linked chain of *overflow pages*, and the leaf keeps only an 8-byte pointer
+(head page id + total length), flagged by the high bit of the entry's length
+field — so old files, which never set that bit, stay readable. `get`/scans
+reassemble the value transparently; overwriting or deleting frees the old chain,
+and `free_all` (drop table/index) reclaims chains too. Values from a few bytes
+to many megabytes are supported. A `validate()` method asserts the structural invariants (key order,
 balance, sibling-chain consistency) and is exercised by randomized fuzz tests.
 The tree is **key-codec generic**: primary keys use fixed-width `int` keys and
 secondary indexes use variable-width `bytes` keys, over the same code.

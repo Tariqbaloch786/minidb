@@ -8,15 +8,15 @@ driver (like `sqlite3`), or as a **networked server** many clients share.
 [![CI](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml/badge.svg)](https://github.com/Tariqbaloch786/minidb/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-129%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-139%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
 minidb implements the pieces a database course spends a semester on — a paged
 storage engine, a **B+Tree** index, a **write-ahead log with crash recovery**, **per-page checksums**, a bounded
-**buffer pool**, a hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
+**buffer pool**, **overflow pages** for large values, a hand-written **SQL parser**, a **query planner**, **`INNER` / `LEFT` joins** with
 an index-nested-loop strategy, **secondary indexes** (`CREATE INDEX`),
 **aggregation** (`GROUP BY` / `HAVING`), **parameterized queries**, and **MVCC
-transactions** — in ~4,000 lines of dependency-free, tested Python. On top of the
+transactions** — in ~4,100 lines of dependency-free, tested Python. On top of the
 engine sit a **DB-API 2.0 driver** and a **client/server** so applications can
 actually use it.
 
@@ -81,7 +81,7 @@ single file divided into 4 KiB pages, exactly like SQLite or Postgres. A second
 | Pager | [`storage/pager.py`](minidb/storage/pager.py) | Checksummed physical page I/O (CRC + page-id per page), allocation, free list; raises `CorruptionError` |
 | Buffer pool | [`storage/buffer_pool.py`](minidb/storage/buffer_pool.py) | Bounded LRU cache, pin/unpin, dirty tracking, hit/miss stats, no-steal buffering |
 | WAL | [`storage/wal.py`](minidb/storage/wal.py) | Redo logging, `fsync` on commit, crash recovery, CRC-checked records |
-| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered index over `int` **or** `bytes` keys; point/range/full scans; splits, delete rebalancing (merge/redistribute/root-collapse), `validate()` |
+| B+Tree | [`storage/btree.py`](minidb/storage/btree.py) | Ordered index over `int` **or** `bytes` keys; point/range/full scans; splits, delete rebalancing, `validate()`; overflow chains for values larger than a page |
 | Indexes | [`engine/index.py`](minidb/engine/index.py) | Secondary indexes: order-preserving key encoding, unique/non-unique, maintenance |
 | Tokenizer/Parser | [`sql/`](minidb/sql/) | Hand-written lexer + recursive-descent parser → typed AST |
 | Catalog | [`engine/catalog.py`](minidb/engine/catalog.py) | Table **and index** schemas, persisted inside the DB file |
@@ -402,7 +402,7 @@ multi-writer concurrency is the documented next step.)*
 
 ```bash
 pip install -e ".[dev]"
-pytest                    # 129 tests across every layer
+pytest                    # 139 tests across every layer
 ruff check .              # lint
 ```
 
@@ -411,7 +411,8 @@ and randomized fuzz), the tokenizer/parser, end-to-end SQL and constraints, the
 planner's access-path choices, secondary indexes, `INNER` / `LEFT` / multi-table
 joins, aggregation with `GROUP BY` / `HAVING`, parameter binding and injection
 safety, the DB-API 2.0 driver, the client/server (including the cross-connection
-transaction lock), **page checksums and corruption detection** (single-byte,
+transaction lock), **overflow pages** for large values (up to ~1 MiB, with
+reuse), **page checksums and corruption detection** (single-byte,
 per-region, truncation, bad headers, invalid page ids), the **buffer pool**
 (hits/misses, LRU eviction, pinning, dirty handling, WAL interaction), a
 **CRUD stress test under forced eviction**, transaction rollback, durability
@@ -430,7 +431,7 @@ minidb/
 tests/       test_btree.py  test_parser.py  test_sql.py  test_joins.py
              test_aggregation.py  test_dbapi.py  test_server.py  test_transactions.py
              test_btree_delete.py  test_indexes.py  test_pager_checksum.py
-             test_buffer_pool.py  test_storage_stress.py
+             test_buffer_pool.py  test_storage_stress.py  test_overflow.py
 benchmarks/  bench.py
 examples/    demo.py  tour.sql
 docs/        ARCHITECTURE.md

@@ -62,8 +62,10 @@ Facade: database.py (execute + txn lifecycle) · dbapi.py (PEP 249) · server.py
   is a full scan. *(The mission's flagged "major priority".)*
 
 ### Values
-- **No overflow pages.** A single value must fit one page (`_split_leaf` raises
-  "value too large"). Large TEXT/BLOB is impossible.
+- ~~No overflow pages.~~ **Done:** a value larger than half a page spills to a
+  chain of overflow pages (the leaf keeps a small pointer), so multi-MiB values
+  work. Reclaimed on delete/overwrite; freed under MVCC once no snapshot needs
+  the version.
 
 ### Concurrency
 - **Single writer.** The server serializes everything under one global lock; the
@@ -140,8 +142,8 @@ format changes bump the file magic (`MDB1` → `MDB2`) and are documented.
 3. ✅ **Page checksums + corruption detection** (`CorruptionError`); meta protected. *(format bump MDB1→MDB2)*
 4. ✅ **Bounded buffer pool:** LRU eviction, pin/unpin, hit/miss stats, no-steal buffering preserving WAL ordering.
 5. ✅ **Secondary indexes:** `CREATE/DROP INDEX`, catalog metadata, order-preserving key encoding, maintenance on DML, planner selection, equality + range scans, unique/non-unique/composite.
-6. Overflow pages for large values. ← *next*
-7. WAL/recovery hardening: LSNs, checkpoint records, expanded crash-injection tests.
+6. ✅ **Overflow pages for large values** (transparent multi-page value chains).
+7. WAL/recovery hardening: LSNs, checkpoint records, expanded crash-injection tests. ← *next*
 
 **Tier 2 — Database correctness**
 8. MVCC hardening + documented isolation levels. 9. Lock manager + deadlock

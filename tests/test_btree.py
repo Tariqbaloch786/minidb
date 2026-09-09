@@ -72,7 +72,23 @@ def test_splits_create_multilevel_tree(pager):
     assert reopened.get(2999) == b"payload-2999"
 
 
-def test_value_too_large_raises(pager):
+def test_large_values_spill_to_overflow(pager):
+    """A value bigger than a page is stored in an overflow chain, transparently."""
     tree = BPlusTree.create(pager)
-    with pytest.raises(ValueError):
-        tree.insert(1, b"x" * 5000)  # bigger than a page
+    big = b"x" * 5000       # bigger than a page
+    huge = bytes(range(256)) * 4096  # ~1 MiB, many overflow pages
+    tree.insert(1, b"small")
+    tree.insert(2, big)
+    tree.insert(3, huge)
+    assert tree.get(1) == b"small"
+    assert tree.get(2) == big
+    assert tree.get(3) == huge
+    tree.validate()
+    # ordered scan reassembles overflow values too
+    assert dict(tree.items()) == {1: b"small", 2: big, 3: huge}
+    # replacing a large value with a small one reclaims the old chain
+    freed_before = tree.pager.meta.free_list_head
+    tree.insert(3, b"tiny")
+    assert tree.get(3) == b"tiny"
+    assert tree.pager.meta.free_list_head != freed_before  # pages returned
+    tree.validate()
